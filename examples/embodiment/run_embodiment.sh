@@ -32,6 +32,9 @@ fi
 ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
 
 export ROBOT_PLATFORM
+# NCCL Debug
+export NCCL_P2P_DISABLE=1  # 禁用P2P通信
+
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
 
 echo "Using Python at $(which python)"
