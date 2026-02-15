@@ -15,7 +15,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0,1
+    actor,env,rollout: all
 
 runner:
   task_type: embodied
@@ -39,7 +39,7 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 8
-  rollout_epoch: 4
+  rollout_epoch: 64
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: action_level  # action_level or chunk_level
@@ -86,7 +86,8 @@ env:
 
   # Override the default values in env/libero_130
   train:
-    total_num_envs: 16
+    total_num_envs: 64
+    group_size: ${algorithm.group_size}
     max_episode_steps: 512 # max episode steps for truncation
     max_steps_per_rollout_epoch: 512
     reward_coef: ${algorithm.reward_coef}
@@ -112,20 +113,20 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora/"
+    model_path: "/path/to/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora/"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 8
-  global_batch_size: 4096
+  micro_batch_size: 32
+  global_batch_size: 16384
   seed: 1234
   enable_offload: True
 
   # Override the default values in model/openvla_oft
   model:
-    model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora/"
+    model_path: "/path/to/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora/"
     model_type: "openvla_oft"
 
     unnorm_key: libero_130_no_noops_trajall
