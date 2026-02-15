@@ -1,1 +1,8 @@
+# 最终merge时记得删除此文件
+
 offline reward 分支，实现我们自己的方法（expert-driven reward for vla rft）
+
+最后merge时，这些地方需要删除：
++ examples/embodiment/run_embodiment.sh 中的 `export NCCL_P2P_DISABLE=1`
++ examples/embodiment/config/libero_10_grpo_openvlaoft.yaml 恢复原样
++ examples/embodiment/config/libero_130_grpo_openvlaoft.yaml 恢复原样
