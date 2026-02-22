@@ -233,6 +233,8 @@ def prepare_actions(
             action_dim=action_dim,
             model_type=model_type,
         )
+    elif env_type == SupportedEnvType.DATASET_ENV:
+        chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.REALWORLD:
         chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.FRANKASIM:

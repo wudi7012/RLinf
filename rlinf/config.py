@@ -775,6 +775,19 @@ def validate_embodied_cfg(cfg):
             "env.train.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
 
+    # Validate dataset_env-specific configuration
+    if SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.DATASET_ENV:
+        assert cfg.env.train.get("data_path", None) is not None, (
+            "env.train.data_path must be specified for dataset_env environment type."
+        )
+
+    if (
+        cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
+    ) and SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.DATASET_ENV:
+        assert cfg.env.eval.get("data_path", None) is not None, (
+            "env.eval.data_path must be specified for dataset_env environment type."
+        )
+
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
         assert weight_sync_interval > 0, "weight_sync_interval must be greater than 0"

@@ -1,0 +1,31 @@
+env_type: dataset_env
+data_path: "/path/to/sft/dataset/"  # Directory containing parquet or npy trajectory files
+
+# Dataset format: "auto" (auto-detect), "parquet" (LeRobot), or "npy"
+data_format: auto
+
+# Reward configuration
+reward_fn: mae  # mae / mse / exp_mae / cosine
+reward_coef: 1.0
+
+# Dataset keys (parquet default: actions, state, image)
+action_key: actions        # key for ground-truth actions
+state_key: state           # key for robot state
+camera_name: image         # key for camera image
+chunk_size: 8              # number of action steps per chunk (should match model's num_action_chunks)
+
+# Environment settings
+total_num_envs: null
+group_size: 8
+auto_reset: True
+ignore_terminations: False
+max_steps_per_rollout_epoch: 8  # = chunk_size (single chunk step per episode)
+max_episode_steps: 8
+
+use_rel_reward: False
+seed: 0
+
+video_cfg:
+  save_video: False
+  info_on_video: False
+  video_base_dir: ${runner.logger.log_path}/video/train
