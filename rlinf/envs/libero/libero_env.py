@@ -71,6 +71,8 @@ class LiberoEnv(gym.Env):
 
         self.video_cfg = cfg.video_cfg
         self.current_raw_obs = None
+        # [DEBUG Phase1C] 查看: self.task_suite.n_tasks, self.num_envs, self.group_size, self.task_ids, self.task_descriptions
+        # breakpoint()
 
     def _init_env(self):
         env_fns = self.get_env_fns()
@@ -339,6 +341,8 @@ class LiberoEnv(gym.Env):
         obs = self._wrap_obs(self.current_raw_obs)
         self._reset_metrics(env_idx)
         infos = {}
+        # [DEBUG Phase4A] 查看: obs.keys(), obs["main_images"].shape, self.task_descriptions[:3]
+        # breakpoint()
         return obs, infos
 
     def step(self, actions=None, auto_reset=True):
@@ -354,7 +358,9 @@ class LiberoEnv(gym.Env):
         obs = self._wrap_obs(raw_obs)
 
         step_reward = self._calc_step_reward(terminations)
-
+        # [DEBUG Phase4B] 仅在有关节成功时断点，查看: terminations, step_reward, self.returns
+        # if terminations.any():
+        #     breakpoint()
         infos = self._record_metrics(step_reward, terminations, infos)
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)

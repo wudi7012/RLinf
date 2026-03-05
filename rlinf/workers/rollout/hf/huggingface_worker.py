@@ -80,6 +80,8 @@ class MultiStepRolloutWorker(Worker):
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
 
         self.hf_model: BasePolicy = get_model(rollout_model_config)
+        # [DEBUG Phase1B] 查看: type(self.hf_model), rollout_model_config, self.hf_model 的结构
+        # breakpoint()
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
@@ -159,7 +161,10 @@ class MultiStepRolloutWorker(Worker):
                 env_obs=env_obs,
                 **kwargs,
             )
-
+        # [DEBUG Phase2B] 仅首次触发。查看: actions.shape, actions[0], result.keys()
+        # if not getattr(self, "_debug_phase2b_done", False):
+        #     self._debug_phase2b_done = True
+        #     breakpoint()
         return actions, result
 
     def get_dones_and_rewards(
@@ -277,7 +282,10 @@ class MultiStepRolloutWorker(Worker):
                     else None,
                     forward_inputs=result["forward_inputs"],
                 )
-
+                # [DEBUG Phase2C] 仅首次触发。查看: dones, rewards, actions.shape
+                # if not getattr(self, "_debug_phase2c_done", False):
+                #     self._debug_phase2c_done = True
+                #     breakpoint()
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
                 if self.collect_transitions and last_obs[stage_id] is not None:
                     curr_obs = last_obs[stage_id]

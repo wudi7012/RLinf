@@ -1075,6 +1075,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.rollout_batch = convert_trajectories_to_batch(recv_list)
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+        # [DEBUG Phase3A] 查看: self.rollout_batch.keys(), rewards shape, dones shape
+        breakpoint()
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
@@ -1170,9 +1172,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
         }
-
+        breakpoint()
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
-
+        # [DEBUG Phase3B] 查看: advantages_and_returns.keys(), advantages shape, returns
         self.rollout_batch.update(advantages_and_returns)
         if kwargs["loss_mask"] is not None:
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
@@ -1187,6 +1189,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Run the training process using the received rollout batch.
         """
+        # [DEBUG Phase3C] 查看: self.rollout_batch keys, global_step
+        # breakpoint()
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
         if self.is_optimizer_offloaded:

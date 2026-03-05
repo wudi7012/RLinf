@@ -70,6 +70,8 @@ class EnvWorker(Worker):
     def init_worker(self):
         train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
         eval_env_cls = get_env_cls(self.cfg.env.eval.env_type, self.cfg.env.eval)
+        # # [DEBUG Phase1A] 查看: train_env_cls, self.cfg.env.train, self.train_num_envs_per_stage, self._rank
+        # breakpoint()
 
         # This is a barrier to ensure all envs' initial setup upon import is done
         # Essential for RealWorld env to ensure initial ROS node setup is done
@@ -125,6 +127,10 @@ class EnvWorker(Worker):
         """
         This function is used to interact with the environment.
         """
+        # [DEBUG Phase2A-pre] 仅首次触发。查看: chunk_actions.shape, chunk_actions (原始动作)
+        # if not getattr(self, "_debug_phase2a_done", False):
+        #     self._debug_phase2a_done = True
+        #     breakpoint()
         chunk_actions = prepare_actions(
             raw_chunk_actions=chunk_actions,
             env_type=self.cfg.env.train.env_type,
@@ -139,6 +145,10 @@ class EnvWorker(Worker):
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
             self.env_list[stage_id].chunk_step(chunk_actions)
         )
+        # [DEBUG Phase2A-post] 仅首次触发。查看: chunk_actions (处理后), chunk_rewards
+        # if not getattr(self, "_debug_phase2a_post_done", False):
+        #     self._debug_phase2a_post_done = True
+        #     breakpoint()
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
         if isinstance(infos_list, (list, tuple)):
