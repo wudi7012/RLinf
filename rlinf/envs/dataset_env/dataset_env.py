@@ -482,7 +482,7 @@ class DatasetEnv:
 
         obs_dict = {
             "main_images": torch.from_numpy(np.stack(images, axis=0)),
-            "wrist_images": None,
+            "wrist_images": None, # todo: add wrist images
             "states": torch.from_numpy(np.stack(states, axis=0)),
             "task_descriptions": descs,
         }

@@ -77,6 +77,25 @@ def prepare_actions_for_libero(
     return chunk_actions
 
 
+def prepare_actions_for_dataset_env(
+    raw_chunk_actions,
+    model_type,
+    wm_env_type=None,
+) -> np.ndarray:
+    """Prepare actions for dataset-backed envs.
+
+    DatasetEnv can emulate different target environment action conventions.
+    Use ``wm_env_type`` to indicate which convention to follow so offline reward
+    comparison is aligned with online evaluation.
+    """
+    if wm_env_type == "libero":
+        return prepare_actions_for_libero(
+            raw_chunk_actions=raw_chunk_actions,
+            model_type=model_type,
+        )
+    return raw_chunk_actions
+
+
 def prepare_actions_for_isaaclab(
     raw_chunk_actions,
     model_type,
@@ -234,7 +253,11 @@ def prepare_actions(
             model_type=model_type,
         )
     elif env_type == SupportedEnvType.DATASET_ENV:
-        chunk_actions = raw_chunk_actions
+        chunk_actions = prepare_actions_for_dataset_env(
+            raw_chunk_actions=raw_chunk_actions,
+            model_type=model_type,
+            wm_env_type=wm_env_type,
+        )
     elif env_type == SupportedEnvType.REALWORLD:
         chunk_actions = raw_chunk_actions
     elif env_type == SupportedEnvType.FRANKASIM:
