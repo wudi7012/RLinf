@@ -1,5 +1,5 @@
 env_type: dataset_env
-data_path: "/path/to/sft/dataset/"  # Directory containing parquet or npy trajectory files
+data_path: "/workspace/data/dataset/data"  # LeRobot parquet dataset
 
 # Dataset format: "auto" (auto-detect), "parquet" (LeRobot), or "npy"
 data_format: auto
@@ -17,7 +17,7 @@ chunk_size: 8              # number of action steps per chunk (should match mode
 # Environment settings
 total_num_envs: null
 group_size: 8
-auto_reset: True
+auto_reset: False
 ignore_terminations: False
 max_steps_per_rollout_epoch: 8  # = chunk_size (single chunk step per episode)
 max_episode_steps: 8

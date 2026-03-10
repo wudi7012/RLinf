@@ -411,7 +411,9 @@ class DatasetEnv:
         first_frame = frames[0]
 
         # ---- image ----
-        image = first_frame.get(self._camera_name) or first_frame.get("image")
+        image = first_frame.get(self._camera_name)
+        if image is None:
+            image = first_frame.get("image")
         if image is None:
             raise ValueError(
                 f"No image key '{self._camera_name}' or 'image' in episode {ep_idx}"
