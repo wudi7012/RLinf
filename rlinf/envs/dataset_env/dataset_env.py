@@ -154,7 +154,11 @@ class _ParquetBackend:
 
             # --- image ---
             img_cell = row.get("image")
-            if isinstance(img_cell, dict) and "bytes" in img_cell:
+            if (
+                isinstance(img_cell, dict)
+                and "bytes" in img_cell
+                and img_cell["bytes"]
+            ):
                 pil_img = Image.open(io.BytesIO(img_cell["bytes"])).convert("RGB")
                 frame["image"] = np.asarray(pil_img, dtype=np.uint8)  # [H,W,3]
             elif isinstance(img_cell, np.ndarray):
@@ -162,9 +166,15 @@ class _ParquetBackend:
 
             # --- wrist_image ---
             wrist_cell = row.get("wrist_image")
-            if isinstance(wrist_cell, dict) and "bytes" in wrist_cell:
+            if (
+                isinstance(wrist_cell, dict)
+                and "bytes" in wrist_cell
+                and wrist_cell["bytes"]
+            ):
                 pil_img = Image.open(io.BytesIO(wrist_cell["bytes"])).convert("RGB")
                 frame["wrist_image"] = np.asarray(pil_img, dtype=np.uint8)
+            elif isinstance(wrist_cell, np.ndarray):
+                frame["wrist_image"] = wrist_cell
 
             # --- actions ---
             actions = row.get("actions")
@@ -597,6 +607,7 @@ class DatasetEnv:
         Returns
         -------
         image : np.ndarray [H, W, C] uint8
+        wrist_image : np.ndarray [H, W, C] uint8 | None
         state : np.ndarray [state_dim] float32
         task_desc : str
         gt_actions : np.ndarray [chunk_size, action_dim] float32
@@ -617,6 +628,14 @@ class DatasetEnv:
                 image = (image * 255).clip(0, 255).astype(np.uint8)
             if image.ndim == 3 and image.shape[0] == 3:
                 image = np.transpose(image, (1, 2, 0))  # CHW -> HWC
+
+        # ---- wrist image (optional) ----
+        wrist_image = first_frame.get("wrist_image")
+        if wrist_image is not None and isinstance(wrist_image, np.ndarray):
+            if wrist_image.dtype in (np.float32, np.float64):
+                wrist_image = (wrist_image * 255).clip(0, 255).astype(np.uint8)
+            if wrist_image.ndim == 3 and wrist_image.shape[0] == 3:
+                wrist_image = np.transpose(wrist_image, (1, 2, 0))  # CHW -> HWC
 
         # ---- state ----
         state = None
@@ -649,7 +668,7 @@ class DatasetEnv:
             gt_chunk.append(action)
 
         gt_actions = np.stack(gt_chunk, axis=0)  # [chunk_size, action_dim]
-        return image, state, task_desc, gt_actions
+        return image, wrist_image, state, task_desc, gt_actions
 
     def _extract_batch(self, episode_indices: np.ndarray):
         """Extract observations and ground-truth actions for a batch.
@@ -659,17 +678,25 @@ class DatasetEnv:
         obs_dict : dict  (main_images, wrist_images, states, task_descriptions)
         gt_actions : np.ndarray [num_envs, chunk_size, action_dim]
         """
-        images, states, descs, gts = [], [], [], []
+        images, wrist_images, states, descs, gts = [], [], [], [], []
+        has_wrist = True
         for ep_idx in episode_indices:
-            img, st, desc, gt = self._extract_single(ep_idx)
+            img, wrist_img, st, desc, gt = self._extract_single(ep_idx)
             images.append(img)
+            wrist_images.append(wrist_img)
+            if wrist_img is None:
+                has_wrist = False
             states.append(st)
             descs.append(desc)
             gts.append(gt)
 
+        wrist_images_tensor = None
+        if has_wrist:
+            wrist_images_tensor = torch.from_numpy(np.stack(wrist_images, axis=0))
+
         obs_dict = {
             "main_images": torch.from_numpy(np.stack(images, axis=0)),
-            "wrist_images": None, # todo: add wrist images
+            "wrist_images": wrist_images_tensor,
             "states": torch.from_numpy(np.stack(states, axis=0)),
             "task_descriptions": descs,
         }
