@@ -24,6 +24,7 @@ action_key: actions        # key for ground-truth actions
 state_key: state           # key for robot state
 camera_name: image         # key for camera image
 chunk_size: 8              # number of action steps per chunk (should match model's num_action_chunks)
+frame_sample_stride: 10    # subsample starts: 0,10,20,... to reduce effective training samples
 
 # Environment settings
 total_num_envs: null

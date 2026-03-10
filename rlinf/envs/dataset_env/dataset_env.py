@@ -307,6 +307,9 @@ class DatasetEnv:
         self._gt_actions: Optional[np.ndarray] = None  # [num_envs, chunk, action_dim]
         self._current_episode_indices: Optional[np.ndarray] = None
         self.task_descriptions: list[str] = [""] * self.num_envs
+        # Episode-local frame cursor to iterate observations with a fixed stride.
+        # Each time an episode is sampled, we advance by ``frame_sample_stride``.
+        self._episode_frame_cursor: dict[int, int] = {}
 
         self._init_metrics()
 
@@ -328,6 +331,13 @@ class DatasetEnv:
         self._state_key = getattr(cfg, "state_key", "state")
         self._camera_name = getattr(cfg, "camera_name", "image")
         self._chunk_size = getattr(cfg, "chunk_size", 8)
+        self._frame_sample_stride = int(getattr(cfg, "frame_sample_stride", 10))
+        if self._frame_sample_stride < 1:
+            logger.warning(
+                "DatasetEnv: invalid frame_sample_stride=%s, falling back to 1",
+                self._frame_sample_stride,
+            )
+            self._frame_sample_stride = 1
         self._task_suite_name = getattr(cfg, "task_suite_name", None)
         self._task_index_to_description_path = getattr(
             cfg, "task_index_to_description_path", None
@@ -337,11 +347,12 @@ class DatasetEnv:
 
         logger.info(
             "DatasetEnv: loaded %d episodes from %s "
-            "(format=%s, chunk_size=%d, action_key=%s)",
+            "(format=%s, chunk_size=%d, frame_sample_stride=%d, action_key=%s)",
             len(self._backend),
             data_path,
             type(self._backend).__name__,
             self._chunk_size,
+            self._frame_sample_stride,
             self._action_key,
         )
 
@@ -613,7 +624,21 @@ class DatasetEnv:
         gt_actions : np.ndarray [chunk_size, action_dim] float32
         """
         frames = self._backend.load_episode(int(ep_idx))
-        first_frame = frames[0]
+        num_frames = len(frames)
+        if num_frames == 0:
+            raise ValueError(f"Empty episode found: {ep_idx}")
+
+        # Subsample episode frames with a fixed stride: 0, stride, 2*stride, ...
+        # then wrap to 0.
+        start_step = self._episode_frame_cursor.get(int(ep_idx), 0)
+        if start_step >= num_frames or start_step < 0:
+            start_step = 0
+        next_step = start_step + self._frame_sample_stride
+        if next_step >= num_frames:
+            next_step = 0
+        self._episode_frame_cursor[int(ep_idx)] = next_step
+
+        first_frame = frames[start_step]
 
         # ---- image ----
         image = first_frame.get(self._camera_name)
@@ -652,8 +677,9 @@ class DatasetEnv:
         # ---- ground-truth action chunk ----
         gt_chunk = []
         for step_idx in range(self._chunk_size):
-            if step_idx < len(frames):
-                frame = frames[step_idx]
+            frame_idx = start_step + step_idx
+            if frame_idx < len(frames):
+                frame = frames[frame_idx]
                 action = None
                 for akey in (self._action_key, "actions", "delta_action", "abs_action"):
                     if akey in frame:
@@ -661,7 +687,7 @@ class DatasetEnv:
                         break
                 if action is None:
                     raise ValueError(
-                        f"No action key '{self._action_key}' in episode {ep_idx} frame {step_idx}"
+                        f"No action key '{self._action_key}' in episode {ep_idx} frame {frame_idx}"
                     )
             else:
                 action = np.zeros_like(gt_chunk[0])
@@ -680,8 +706,14 @@ class DatasetEnv:
         """
         images, wrist_images, states, descs, gts = [], [], [], [], []
         has_wrist = True
+        # Important for GRPO grouping: same episode id in one batch should map to
+        # the same sampled frame/chunk.
+        sample_cache: dict[int, tuple[np.ndarray, Optional[np.ndarray], np.ndarray, str, np.ndarray]] = {}
         for ep_idx in episode_indices:
-            img, wrist_img, st, desc, gt = self._extract_single(ep_idx)
+            ep_idx = int(ep_idx)
+            if ep_idx not in sample_cache:
+                sample_cache[ep_idx] = self._extract_single(ep_idx)
+            img, wrist_img, st, desc, gt = sample_cache[ep_idx]
             images.append(img)
             wrist_images.append(wrist_img)
             if wrist_img is None:
@@ -759,9 +791,20 @@ class DatasetEnv:
                 self._gt_actions[idx] = partial_gt[i]
                 self.task_descriptions[idx] = partial_obs["task_descriptions"][i]
                 self._current_episode_indices[idx] = reset_state_ids[i]
+                self._current_obs["main_images"][idx] = partial_obs["main_images"][i]
+                self._current_obs["states"][idx] = partial_obs["states"][i]
+                self._current_obs["task_descriptions"][idx] = partial_obs[
+                    "task_descriptions"
+                ][i]
+                if (
+                    self._current_obs.get("wrist_images", None) is not None
+                    and partial_obs.get("wrist_images", None) is not None
+                ):
+                    self._current_obs["wrist_images"][idx] = partial_obs["wrist_images"][
+                        i
+                    ]
 
-            obs_dict, _ = self._extract_batch(self._current_episode_indices)
-            self._current_obs = obs_dict
+            obs_dict = self._current_obs
 
         self._reset_metrics(env_idx)
         infos = {}
