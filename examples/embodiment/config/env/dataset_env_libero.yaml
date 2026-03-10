@@ -4,6 +4,13 @@ data_path: "/workspace/data/dataset/data"  # LeRobot parquet dataset
 # Dataset format: "auto" (auto-detect), "parquet" (LeRobot), or "npy"
 data_format: auto
 
+# Map task_index to natural language prompts.
+# DatasetEnv auto-discovers LeRobot meta/tasks.jsonl near `data_path`.
+# `task_suite_name` is used only as a fallback for missing ids.
+task_suite_name: libero_130
+# Optional explicit mapping file (.json/.jsonl); highest priority.
+task_index_to_description_path: null
+
 # Target action convention for offline reward comparison.
 # Set to "libero" to apply the same gripper post-processing as online Libero env.
 wm_env_type: libero

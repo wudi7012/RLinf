@@ -39,6 +39,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import json
 import logging
 import os
 from typing import Optional, Union
@@ -175,10 +176,20 @@ class _ParquetBackend:
             if state is not None:
                 frame["state"] = np.asarray(state, dtype=np.float32)
 
-            # --- task description (parquet only has task_index) ---
+            # --- optional language fields ---
+            for text_key in ("instruction", "task"):
+                text_value = row.get(text_key)
+                if text_value is None:
+                    continue
+                # Pandas may surface missing string as NaN float.
+                if isinstance(text_value, float) and np.isnan(text_value):
+                    continue
+                frame[text_key] = text_value
+
+            # --- task metadata ---
             task_idx = row.get("task_index")
             if task_idx is not None:
-                frame["task"] = f"task_{int(task_idx)}"
+                frame["task_index"] = int(task_idx)
 
             frames.append(frame)
         return frames
@@ -307,6 +318,12 @@ class DatasetEnv:
         self._state_key = getattr(cfg, "state_key", "state")
         self._camera_name = getattr(cfg, "camera_name", "image")
         self._chunk_size = getattr(cfg, "chunk_size", 8)
+        self._task_suite_name = getattr(cfg, "task_suite_name", None)
+        self._task_index_to_description_path = getattr(
+            cfg, "task_index_to_description_path", None
+        )
+        self._task_index_to_description = self._build_task_description_map(cfg)
+        self._missing_task_description_indices: set[int] = set()
 
         logger.info(
             "DatasetEnv: loaded %d episodes from %s "
@@ -317,6 +334,183 @@ class DatasetEnv:
             self._chunk_size,
             self._action_key,
         )
+
+    def _build_task_description_map(self, cfg) -> dict[int, str]:
+        """Build task_index -> natural language description mapping.
+
+        Priority:
+        1) user-provided mapping file (JSON or JSONL)
+        2) auto-discovered LeRobot ``meta/tasks.jsonl``
+        3) LIBERO benchmark task language by ``task_suite_name``
+        """
+        mapping: dict[int, str] = {}
+
+        def _merge_mapping_from_tasks_jsonl(path: str) -> int:
+            added = 0
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        continue
+                    task_idx = record.get("task_index")
+                    if task_idx is None:
+                        continue
+                    task_text = record.get("task")
+                    if task_text is None:
+                        continue
+                    try:
+                        idx = int(task_idx)
+                    except (TypeError, ValueError):
+                        continue
+                    if idx in mapping:
+                        continue
+                    mapping[idx] = str(task_text)
+                    added += 1
+            return added
+
+        def _merge_mapping_from_json(path: str) -> int:
+            added = 0
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                items = data.items()
+            elif isinstance(data, list):
+                # Support [{"task_index": 0, "task": "..."}] style.
+                items = []
+                for row in data:
+                    if isinstance(row, dict) and "task_index" in row and "task" in row:
+                        items.append((row["task_index"], row["task"]))
+            else:
+                items = []
+            for key, value in items:
+                try:
+                    idx = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if value is None or idx in mapping:
+                    continue
+                mapping[idx] = str(value)
+                added += 1
+            return added
+
+        def _merge_mapping_from_path(path: str) -> int:
+            if path.endswith(".jsonl"):
+                return _merge_mapping_from_tasks_jsonl(path)
+            return _merge_mapping_from_json(path)
+
+        mapping_path = self._task_index_to_description_path
+        if mapping_path:
+            if not os.path.exists(mapping_path):
+                logger.warning(
+                    "DatasetEnv: task_index_to_description_path does not exist: %s",
+                    mapping_path,
+                )
+            else:
+                try:
+                    added = _merge_mapping_from_path(mapping_path)
+                    logger.info(
+                        "DatasetEnv: loaded %d task descriptions from mapping path %s",
+                        added,
+                        mapping_path,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "DatasetEnv: failed to load task description mapping from %s: %s",
+                        mapping_path,
+                        e,
+                    )
+
+        # Auto-discover LeRobot meta/tasks.jsonl near data_path.
+        data_path_abs = os.path.abspath(cfg.data_path)
+        candidate_paths = [
+            os.path.join(data_path_abs, "meta", "tasks.jsonl"),
+            os.path.join(os.path.dirname(data_path_abs), "meta", "tasks.jsonl"),
+            os.path.join(os.path.dirname(os.path.dirname(data_path_abs)), "meta", "tasks.jsonl"),
+        ]
+        for candidate in candidate_paths:
+            if not os.path.exists(candidate):
+                continue
+            try:
+                added = _merge_mapping_from_tasks_jsonl(candidate)
+                logger.info(
+                    "DatasetEnv: loaded %d task descriptions from dataset meta %s",
+                    added,
+                    candidate,
+                )
+            except Exception as e:
+                logger.warning(
+                    "DatasetEnv: failed to parse dataset meta task descriptions from %s: %s",
+                    candidate,
+                    e,
+                )
+            break
+
+        suite_name = getattr(cfg, "task_suite_name", None)
+        if suite_name:
+            try:
+                from rlinf.envs.libero.utils import get_benchmark_overridden
+
+                task_suite = get_benchmark_overridden(suite_name)()
+                for task_id in range(task_suite.get_num_tasks()):
+                    if task_id in mapping:
+                        continue
+                    task = task_suite.get_task(task_id)
+                    mapping[task_id] = str(task.language)
+                logger.info(
+                    "DatasetEnv: resolved %d task descriptions from LIBERO suite '%s'",
+                    len(mapping),
+                    suite_name,
+                )
+            except Exception as e:
+                logger.warning(
+                    "DatasetEnv: failed to build task description map from suite '%s': %s",
+                    suite_name,
+                    e,
+                )
+        return mapping
+
+    def _resolve_task_description(self, first_frame: dict) -> str:
+        # Prefer explicit natural language fields from dataset.
+        for key in ("instruction", "task"):
+            if key in first_frame:
+                td = first_frame[key]
+                if isinstance(td, (bytes, np.bytes_)):
+                    td = td.decode("utf-8")
+                task_desc = str(td)
+                if task_desc:
+                    # If legacy placeholder text was stored, try mapping from task_index.
+                    if task_desc.startswith("task_") and "task_index" in first_frame:
+                        try:
+                            task_idx = int(first_frame["task_index"])
+                            return self._task_index_to_description.get(
+                                task_idx, task_desc
+                            )
+                        except (TypeError, ValueError):
+                            return task_desc
+                    return task_desc
+
+        # Fall back to task_index mapping.
+        task_idx = first_frame.get("task_index", None)
+        if task_idx is not None:
+            try:
+                task_idx = int(task_idx)
+                if task_idx in self._task_index_to_description:
+                    return self._task_index_to_description[task_idx]
+                if task_idx not in self._missing_task_description_indices:
+                    logger.warning(
+                        "DatasetEnv: missing natural-language task description for task_index=%d. "
+                        "Falling back to placeholder 'task_%d'.",
+                        task_idx,
+                        task_idx,
+                    )
+                    self._missing_task_description_indices.add(task_idx)
+                return f"task_{task_idx}"
+            except (TypeError, ValueError):
+                pass
+        return ""
 
     @property
     def _num_episodes(self) -> int:
@@ -434,14 +628,7 @@ class DatasetEnv:
             state = np.zeros(7, dtype=np.float32)
 
         # ---- task description ----
-        task_desc = ""
-        for key in ("instruction", "task"):
-            if key in first_frame:
-                td = first_frame[key]
-                if isinstance(td, (bytes, np.bytes_)):
-                    td = td.decode("utf-8")
-                task_desc = str(td)
-                break
+        task_desc = self._resolve_task_description(first_frame)
 
         # ---- ground-truth action chunk ----
         gt_chunk = []
