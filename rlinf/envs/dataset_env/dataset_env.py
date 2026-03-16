@@ -26,8 +26,10 @@ Supports two dataset formats:
 Each episode consists of a single chunk step:
   1. ``reset()`` draws (observation, ground_truth_actions) from the dataset.
   2. ``chunk_step(predicted_actions)`` computes a rule-based reward
-     (e.g. negative MAE) between the predicted actions and the ground truth,
-     then immediately terminates the episode.
+     (e.g. negative MAE) between the predicted actions and the ground truth.
+     Reward comparison can happen either on raw delta actions or on cumulative
+     actions. The resulting reward can be emitted either as a single chunk-level
+     score or as per-action scores. The episode then immediately terminates.
 
 This enables GRPO-style training where ``group_size`` environments share the
 same observation and different action predictions are compared via relative
@@ -60,24 +62,41 @@ __all__ = ["DatasetEnv"]
 # ---------------------------------------------------------------------------
 
 
-def _reward_mae(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-    """Negative MAE per environment, averaged over chunk and action dims."""
-    return -torch.mean(torch.abs(pred - gt), dim=(1, 2))  # [num_envs]
+def _reward_mae(
+    pred: torch.Tensor, gt: torch.Tensor, per_action: bool = False
+) -> torch.Tensor:
+    """Negative MAE on either chunk-level or per-action level."""
+    errors = torch.abs(pred - gt)
+    if per_action:
+        return -torch.mean(errors, dim=2)  # [num_envs, chunk]
+    return -torch.mean(errors, dim=(1, 2))  # [num_envs]
 
 
-def _reward_mse(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-    """Negative MSE per environment."""
-    return -torch.mean((pred - gt) ** 2, dim=(1, 2))
+def _reward_mse(
+    pred: torch.Tensor, gt: torch.Tensor, per_action: bool = False
+) -> torch.Tensor:
+    """Negative MSE on either chunk-level or per-action level."""
+    errors = (pred - gt) ** 2
+    if per_action:
+        return -torch.mean(errors, dim=2)
+    return -torch.mean(errors, dim=(1, 2))
 
 
-def _reward_exp_mae(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-    """exp(-MAE) reward in [0, 1]."""
-    mae = torch.mean(torch.abs(pred - gt), dim=(1, 2))
+def _reward_exp_mae(
+    pred: torch.Tensor, gt: torch.Tensor, per_action: bool = False
+) -> torch.Tensor:
+    """exp(-MAE) reward in [0, 1] on chunk-level or per-action level."""
+    mae = torch.mean(torch.abs(pred - gt), dim=2 if per_action else (1, 2))
     return torch.exp(-mae)
 
 
-def _reward_cosine(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-    """Cosine similarity averaged over chunk steps."""
+def _reward_cosine(
+    pred: torch.Tensor, gt: torch.Tensor, per_action: bool = False
+) -> torch.Tensor:
+    """Cosine similarity on chunk-level or per-action level."""
+    if per_action:
+        return torch.nn.functional.cosine_similarity(pred, gt, dim=2)
+
     pred_flat = pred.reshape(pred.shape[0], -1)
     gt_flat = gt.reshape(gt.shape[0], -1)
     return torch.nn.functional.cosine_similarity(pred_flat, gt_flat, dim=1)
@@ -288,6 +307,18 @@ class DatasetEnv:
             )
         self._reward_fn = _REWARD_FN_MAP[reward_fn_name]
         self.reward_coef = getattr(cfg, "reward_coef", 1.0)
+        self.reward_action_mode = getattr(cfg, "reward_action_mode", "delta")
+        self.reward_granularity = getattr(cfg, "reward_granularity", "chunk")
+        if self.reward_action_mode not in {"delta", "cumulative"}:
+            raise ValueError(
+                f"Unknown reward_action_mode '{self.reward_action_mode}'. "
+                "Supported: ['delta', 'cumulative']"
+            )
+        if self.reward_granularity not in {"chunk", "per_action"}:
+            raise ValueError(
+                f"Unknown reward_granularity '{self.reward_granularity}'. "
+                "Supported: ['chunk', 'per_action']"
+            )
 
         # Random generator for sampling
         self._generator = np.random.default_rng(seed=self.seed)
@@ -628,13 +659,15 @@ class DatasetEnv:
         if num_frames == 0:
             raise ValueError(f"Empty episode found: {ep_idx}")
 
-        # Subsample episode frames with a fixed stride: 0, stride, 2*stride, ...
-        # then wrap to 0.
+        # Subsample episode starts with a fixed stride: 0, stride, 2*stride, ...
+        # Keep starts within the range that can provide a full action chunk.
+        # This avoids synthetic zero-padding targets near episode tail.
+        max_start_step = max(0, num_frames - self._chunk_size)
         start_step = self._episode_frame_cursor.get(int(ep_idx), 0)
-        if start_step >= num_frames or start_step < 0:
+        if start_step > max_start_step or start_step < 0:
             start_step = 0
         next_step = start_step + self._frame_sample_stride
-        if next_step >= num_frames:
+        if next_step > max_start_step:
             next_step = 0
         self._episode_frame_cursor[int(ep_idx)] = next_step
 
@@ -678,7 +711,10 @@ class DatasetEnv:
         gt_chunk = []
         for step_idx in range(self._chunk_size):
             frame_idx = start_step + step_idx
-            if frame_idx < len(frames):
+            if frame_idx >= len(frames):
+                # Defensive fallback for exceptionally short episodes.
+                action = np.zeros_like(gt_chunk[0])
+            else:
                 frame = frames[frame_idx]
                 action = None
                 for akey in (self._action_key, "actions", "delta_action", "abs_action"):
@@ -689,8 +725,6 @@ class DatasetEnv:
                     raise ValueError(
                         f"No action key '{self._action_key}' in episode {ep_idx} frame {frame_idx}"
                     )
-            else:
-                action = np.zeros_like(gt_chunk[0])
             gt_chunk.append(action)
 
         gt_actions = np.stack(gt_chunk, axis=0)  # [chunk_size, action_dim]
@@ -816,6 +850,24 @@ class DatasetEnv:
             "DatasetEnv uses chunk_step only. Use chunk_step() instead."
         )
 
+    def _transform_actions_for_reward(
+        self, pred: torch.Tensor, gt: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project actions to the representation used by reward comparison."""
+        if self.reward_action_mode == "delta":
+            return pred, gt
+        return torch.cumsum(pred, dim=1), torch.cumsum(gt, dim=1)
+
+    def _get_chunk_level_reward_inputs(
+        self, pred: torch.Tensor, gt: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get inputs used by chunk-level reward computation."""
+        if self.reward_action_mode == "cumulative":
+            # For cumulative chunk-level reward, only compare the final cumulative
+            # action instead of averaging over all intermediate cumulative states.
+            return pred[:, -1:, :], gt[:, -1:, :]
+        return pred, gt
+
     def chunk_step(self, chunk_actions):
         """Execute one chunk step and compute the offline reward.
 
@@ -845,13 +897,23 @@ class DatasetEnv:
         min_chunk = min(chunk_size, gt_actions_t.shape[1])
         pred = chunk_actions_t[:, :min_chunk, :]
         gt = gt_actions_t[:, :min_chunk, :]
+        pred, gt = self._transform_actions_for_reward(pred, gt)
 
-        # Compute per-environment scalar reward
-        env_rewards = self._reward_fn(pred, gt) * self.reward_coef  # [num_envs]
-
-        # Spread reward: only the last step carries the reward
+        # Compare either raw deltas or cumulative actions, then emit either a
+        # single chunk-level reward or a per-action reward sequence.
         chunk_rewards = torch.zeros(self.num_envs, chunk_size, dtype=torch.float32)
-        chunk_rewards[:, -1] = env_rewards
+        if self.reward_granularity == "per_action":
+            per_action_rewards = self._reward_fn(
+                pred, gt, per_action=True
+            ) * self.reward_coef  # [num_envs, min_chunk]
+            chunk_rewards[:, :min_chunk] = per_action_rewards
+            env_rewards = per_action_rewards.sum(dim=1)  # [num_envs]
+        else:
+            chunk_pred, chunk_gt = self._get_chunk_level_reward_inputs(pred, gt)
+            env_rewards = (
+                self._reward_fn(chunk_pred, chunk_gt) * self.reward_coef
+            )  # [num_envs]
+            chunk_rewards[:, -1] = env_rewards
 
         # Update elapsed steps
         self._elapsed_steps += chunk_size

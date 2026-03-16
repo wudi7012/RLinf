@@ -220,6 +220,22 @@ def compute_grpo_dynamic_advantages(
     return advantages, None
 
 
+@register_advantage("grpo_per_action")
+def compute_grpo_per_action_advantages(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    group_size: int,
+    **kwargs,
+):
+    """Per-action-step GRPO: normalize rewards within each group at every step independently."""
+    n_steps, bsz = rewards.shape
+    grouped = rewards.reshape(n_steps, -1, group_size)
+    mean = grouped.mean(dim=-1, keepdim=True)
+    std = grouped.std(dim=-1, keepdim=True)
+    advantages = ((grouped - mean) / (std + 1e-6)).reshape(n_steps, -1) * loss_mask
+    return advantages, None
+
+
 @register_advantage("reinpp")
 def compute_reinpp_advantages(
     rewards: torch.Tensor,
