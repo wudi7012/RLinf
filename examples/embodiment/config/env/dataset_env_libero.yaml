@@ -18,7 +18,7 @@ wm_env_type: libero
 # Reward configuration
 reward_fn: mae  # mae / mse / exp_mae / cosine
 reward_coef: 1.0
-reward_action_mode: delta  # delta / cumulative
+reward_action_mode: cumulative  # delta / cumulative
 reward_granularity: chunk  # per_action if using grpo_per_action, chunk if using grpo (see @libero_grpo_openvlaoft_offline.yaml (50-51))
 
 # Dataset keys (parquet default: actions, state, image)
