@@ -44,6 +44,7 @@ import io
 import json
 import logging
 import os
+from functools import partial
 from typing import Optional, Union
 
 import numpy as np
@@ -102,11 +103,58 @@ def _reward_cosine(
     return torch.nn.functional.cosine_similarity(pred_flat, gt_flat, dim=1)
 
 
+def _reward_mdpr(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    per_action: bool = False,
+    num_bins: int = 256,
+    pose_sensitivity: float = 5.0,
+    pose_weight: float = 0.8,
+    grip_weight: float = 0.2,
+    qacr_weight: float = 0.7,
+    ctar_weight: float = 0.3,
+    fcr_weight: float = 0.1,
+    grip_dim: int = -1,
+    action_range: tuple[float, float] = (-1.0, 1.0),
+) -> torch.Tensor:
+    """MDPR (Multi-Dimensional Process Reward): QACR + CTAR + FCR.
+
+    QACR — quantized action token consistency (discrete bin match ratio).
+    CTAR — continuous trajectory alignment (pose exp-decay + gripper match).
+    FCR  — format compliance (always 1 in offline dataset_env context).
+    """
+    _, _, action_dim = pred.shape
+    grip_idx = grip_dim % action_dim
+    pose_idx = [i for i in range(action_dim) if i != grip_idx]
+
+    # QACR: quantize to discrete bins, then token-match ratio
+    lo, hi = action_range
+    scale = (num_bins - 1) / (hi - lo)
+    pred_tok = ((pred.clamp(lo, hi) - lo) * scale).long()
+    gt_tok = ((gt.clamp(lo, hi) - lo) * scale).long()
+    token_match = (pred_tok == gt_tok).float()
+
+    # CTAR: pose exp(-sensitivity * L1) + gripper binary match, per step
+    d_pose = torch.abs(pred[:, :, pose_idx] - gt[:, :, pose_idx]).mean(dim=2)
+    r_pose = torch.exp(-pose_sensitivity * d_pose)
+    r_grip = (torch.sign(pred[:, :, grip_idx]) == torch.sign(gt[:, :, grip_idx])).float()
+    ctar_step = pose_weight * r_pose + grip_weight * r_grip
+
+    if per_action:
+        qacr = token_match.mean(dim=2)
+        return qacr_weight * qacr + ctar_weight * ctar_step + fcr_weight
+
+    qacr = token_match.mean(dim=(1, 2))
+    ctar = ctar_step.mean(dim=1)
+    return qacr_weight * qacr + ctar_weight * ctar + fcr_weight
+
+
 _REWARD_FN_MAP = {
     "mae": _reward_mae,
     "mse": _reward_mse,
     "exp_mae": _reward_exp_mae,
     "cosine": _reward_cosine,
+    "mdpr": _reward_mdpr,
 }
 
 
@@ -306,6 +354,15 @@ class DatasetEnv:
                 f"Supported: {list(_REWARD_FN_MAP.keys())}"
             )
         self._reward_fn = _REWARD_FN_MAP[reward_fn_name]
+        if reward_fn_name == "mdpr":
+            mdpr_kw = {}
+            for k in ("num_bins", "pose_sensitivity", "pose_weight", "grip_weight",
+                       "qacr_weight", "ctar_weight", "fcr_weight", "grip_dim"):
+                v = getattr(cfg, f"mdpr_{k}", None)
+                if v is not None:
+                    mdpr_kw[k] = v
+            if mdpr_kw:
+                self._reward_fn = partial(self._reward_fn, **mdpr_kw)
         self.reward_coef = getattr(cfg, "reward_coef", 1.0)
         self.reward_action_mode = getattr(cfg, "reward_action_mode", "delta")
         self.reward_granularity = getattr(cfg, "reward_granularity", "chunk")

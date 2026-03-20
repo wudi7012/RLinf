@@ -33,7 +33,7 @@ runner:
   save_interval: 25
 
   resume_dir: null
-  ckpt_path: /workspace/RLinf/logs/20260310-16:08:47-libero_grpo_openvlaoft_offline/libero_grpo_openvlaoft_offline/checkpoints/global_step_1250/actor/model_state_dict/full_weights.pt
+  ckpt_path: /workspace/RLinf/logs/20260310-14:52:20-libero_grpo_openvlaoft_offline/libero_grpo_openvlaoft_offline/checkpoints/global_step_5/actor/model_state_dict/full_weights.pt
 
 algorithm:
   normalize_advantages: True
