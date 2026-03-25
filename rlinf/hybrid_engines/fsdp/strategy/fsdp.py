@@ -78,6 +78,14 @@ class FSDPStrategy(FSDPStrategyBase):
             self.cfg.fsdp_config.backward_prefetch
         )
 
+        if self.logger is not None:
+            self.logger.info(
+                "[FSDP] wrap_model: creating FSDP module "
+                f"(sharding_strategy={self.cfg.fsdp_config.sharding_strategy}, "
+                f"use_orig_params={self.cfg.fsdp_config.use_orig_params}, "
+                f"forward_prefetch={self.cfg.fsdp_config.forward_prefetch}, "
+                f"limit_all_gathers={self.cfg.fsdp_config.limit_all_gathers})"
+            )
         fsdp_model = FSDP(
             module=model,
             param_init_fn=init_fn,
@@ -92,6 +100,8 @@ class FSDPStrategy(FSDPStrategyBase):
             limit_all_gathers=self.cfg.fsdp_config.limit_all_gathers,
             use_orig_params=self.cfg.fsdp_config.use_orig_params,
         )
+        if self.logger is not None:
+            self.logger.info("[FSDP] wrap_model: FSDP module creation complete")
         return fsdp_model
 
     @classmethod

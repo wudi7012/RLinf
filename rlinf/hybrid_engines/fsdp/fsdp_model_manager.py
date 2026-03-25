@@ -239,7 +239,11 @@ class FSDPModelManager:
         """
         Setup model, lr_scheduler, optimizer and grad_scaler.
         """
+        self._logger.info("[FSDP] setup_model_and_optimizer: starting model_provider_func")
         module = self.model_provider_func()
+        self._logger.info(
+            f"[FSDP] setup_model_and_optimizer: model_provider_func complete, module={module.__class__.__name__}"
+        )
 
         # Enable gradient checkpointing if configured
         if self._cfg.fsdp_config.get("gradient_checkpointing", False):
@@ -249,19 +253,29 @@ class FSDPModelManager:
             self._logger.info("[FSDP] Gradient checkpointing is disabled")
 
         # build model, optimizer, lr_scheduler, grad_scaler
+        self._logger.info("[FSDP] setup_model_and_optimizer: entering wrap_model")
         self.model = self._strategy.wrap_model(
             model=module, device_mesh=self._device_mesh
         )
+        self._logger.info("[FSDP] setup_model_and_optimizer: wrap_model complete")
+
+        self._logger.info("[FSDP] setup_model_and_optimizer: building optimizer")
         self.optimizer = self.build_optimizer(
             model=self.model, enable_critic_warmup=self.critic_warmup_steps > 0
         )
+        self._logger.info("[FSDP] setup_model_and_optimizer: optimizer complete")
 
+        self._logger.info("[FSDP] setup_model_and_optimizer: building lr scheduler")
         self.lr_scheduler = self.build_lr_scheduler(
             optimizer=self.optimizer, optim_config=self._cfg.optim
         )
+        self._logger.info("[FSDP] setup_model_and_optimizer: lr scheduler complete")
+
+        self._logger.info("[FSDP] setup_model_and_optimizer: building grad scaler")
         self.grad_scaler = self.build_grad_scaler(
             self._cfg.fsdp_config.amp.use_grad_scaler
         )
+        self._logger.info("[FSDP] setup_model_and_optimizer: complete")
 
     def get_model_state_dict(self, cpu_offload: bool, full_state_dict: bool) -> dict:
         """
@@ -476,6 +490,16 @@ class FSDPModelManager:
                     "betas": betas,
                 }
             )
+        actor_param_count = sum(param.numel() for param in params_actor)
+        critic_param_count = sum(param.numel() for param in params_critic)
+        self._logger.info(
+            "[FSDP] build_optimizer: actor_tensors=%d actor_params=%d critic_tensors=%d critic_params=%d",
+            len(params_actor),
+            actor_param_count,
+            len(params_critic),
+            critic_param_count,
+        )
+        self._logger.info("[FSDP] build_optimizer: creating AdamW")
         optimizer = torch.optim.AdamW(
             param_groups,
             eps=adam_eps,
@@ -485,7 +509,9 @@ class FSDPModelManager:
         # run optimizer empty step to initialize optimizer.state
         # to avoid KeyError during get_state_dict/set_state_dict
         # in save/load_checkpoint calls
+        self._logger.info("[FSDP] build_optimizer: warming optimizer state")
         warmup_optimizer_state(optimizer)
+        self._logger.info("[FSDP] build_optimizer: optimizer state warmup complete")
         return optimizer
 
     def build_optimizers(

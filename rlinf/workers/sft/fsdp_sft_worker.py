@@ -81,11 +81,15 @@ class FSDPSftWorker(FSDPModelManager, Worker):
         self._data_iter_offset = 0
 
     def init_worker(self):
+        logging.info("[SFT] init_worker: starting setup_model_and_optimizer")
         self.setup_model_and_optimizer()
+        logging.info("[SFT] init_worker: setup_model_and_optimizer complete")
 
         if self.cfg.actor.get("enable_offload", False):
+            logging.info("[SFT] init_worker: enabling parameter/optimizer offload")
             self.offload_param_and_grad()
             self.offload_optimizer()
+            logging.info("[SFT] init_worker: offload complete")
 
     def model_provider_func(self):
         model = get_model(self.cfg.actor.model)

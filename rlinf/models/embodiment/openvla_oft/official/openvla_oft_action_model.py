@@ -573,8 +573,25 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
-        else:
-            raise NotImplementedError
+        if forward_type == ForwardType.SFT:
+            return self.sft_forward(**kwargs)
+        raise NotImplementedError
+
+    def sft_forward(self, batch: dict[str, torch.Tensor]):
+        outputs = OpenVLAOFTForActionPrediction.forward(
+            self,
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            pixel_values=batch["pixel_values"],
+            labels=batch["labels"],
+            use_cache=False,
+            output_hidden_states=False,
+            return_dict=True,
+            proprio=batch.get("proprio", None),
+            proprio_projector=self.proprio_projector,
+            use_film=self.use_film,
+        )
+        return outputs.loss
 
     def default_forward(
         self,
