@@ -47,14 +47,14 @@ actor:
     model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora"
     unnorm_key: libero_130_no_noops_trajall
     max_prompt_length: 128
-    is_lora: False
+    is_lora: True
     lora_rank: 32
     lora_path: null
     num_images_in_input: 1
     use_proprio: False
 
   optim:
-    lr: 5.0e-4
+    lr: 1.0e-4
     value_lr: 5.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
