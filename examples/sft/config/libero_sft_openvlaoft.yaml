@@ -63,7 +63,7 @@ actor:
     clip_grad: 1.0
     warmup_style: "cosine"
     lr_warmup_steps: 100
-    total_training_steps: 5000
+    total_training_steps: 10000
 
   fsdp_config:
     strategy: "fsdp"

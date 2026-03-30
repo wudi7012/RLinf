@@ -33,7 +33,7 @@ runner:
   save_interval: 25
 
   resume_dir: null
-  ckpt_path: /workspace/RLinf/logs/20260320-04:35:29-libero_grpo_openvlaoft_offline/libero_grpo_openvlaoft_offline/checkpoints/global_step_5/actor/model_state_dict/full_weights.pt
+  ckpt_path: /workspace/RLinf/logs/20260326-16:16:36/libero_sft_openvlaoft/checkpoints/global_step_5000/actor/model_state_dict/full_weights.pt
 algorithm:
   normalize_advantages: True
   kl_penalty: kl
@@ -86,18 +86,18 @@ env:
     total_num_envs: 500
 
   eval:
-    total_num_envs: 52
+    total_num_envs: 14
     auto_reset: True
     ignore_terminations: True
     group_size: 1
     max_episode_steps: 512
-    max_steps_per_rollout_epoch: 1024
+    max_steps_per_rollout_epoch: 4096
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
     reset_gripper_open: False
     is_eval: True
     video_cfg:
-      save_video: True
+      save_video: False
       video_base_dir: ${runner.logger.log_path}/video/eval
 
 rollout:
