@@ -52,6 +52,7 @@ import torch
 from PIL import Image
 
 from rlinf.envs.utils import to_tensor
+from rlinf.models.vla_adapter.reward_utils import compose_reward, compute_error
 
 logger = logging.getLogger(__name__)
 
@@ -364,8 +365,21 @@ class DatasetEnv:
             if mdpr_kw:
                 self._reward_fn = partial(self._reward_fn, **mdpr_kw)
         self.reward_coef = getattr(cfg, "reward_coef", 1.0)
+        self.reward_type = getattr(
+            cfg,
+            "reward_type",
+            getattr(cfg, "adapter_reward_type", "absolute"),
+        )
+        self.error_fn = getattr(cfg, "error_fn", reward_fn_name)
+        self.residual_penalty_type = getattr(cfg, "residual_penalty", "none")
+        self.residual_coef = float(getattr(cfg, "residual_coef", 0.0))
         self.reward_action_mode = getattr(cfg, "reward_action_mode", "delta")
         self.reward_granularity = getattr(cfg, "reward_granularity", "chunk")
+        if self.reward_type not in {"absolute", "improvement"}:
+            raise ValueError(
+                f"Unknown reward_type '{self.reward_type}'. "
+                "Supported: ['absolute', 'improvement']"
+            )
         if self.reward_action_mode not in {"delta", "cumulative"}:
             raise ValueError(
                 f"Unknown reward_action_mode '{self.reward_action_mode}'. "
@@ -938,12 +952,21 @@ class DatasetEnv:
         tuple of (obs_list, chunk_rewards, chunk_terminations,
                   chunk_truncations, infos_list)
         """
-        if isinstance(chunk_actions, torch.Tensor):
-            chunk_actions_t = chunk_actions.detach().float()
+        def _to_float_tensor(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.detach().float()
+            return torch.from_numpy(np.asarray(value, dtype=np.float32))
+
+        base_actions_t = None
+        delta_actions_t = None
+        if isinstance(chunk_actions, dict):
+            chunk_actions_t = _to_float_tensor(chunk_actions["actions"])
+            base_actions_t = _to_float_tensor(chunk_actions.get("base_actions"))
+            delta_actions_t = _to_float_tensor(chunk_actions.get("delta_actions"))
         else:
-            chunk_actions_t = torch.from_numpy(
-                np.asarray(chunk_actions, dtype=np.float32)
-            )
+            chunk_actions_t = _to_float_tensor(chunk_actions)
 
         chunk_size = chunk_actions_t.shape[1]
         assert self._gt_actions is not None, "Must call reset() before chunk_step()"
@@ -955,22 +978,55 @@ class DatasetEnv:
         pred = chunk_actions_t[:, :min_chunk, :]
         gt = gt_actions_t[:, :min_chunk, :]
         pred, gt = self._transform_actions_for_reward(pred, gt)
+        base = None
+        if base_actions_t is not None:
+            base = base_actions_t[:, :min_chunk, :]
+            base, _ = self._transform_actions_for_reward(base, gt_actions_t[:, :min_chunk, :])
+        delta = None
+        if delta_actions_t is not None:
+            delta = delta_actions_t[:, :min_chunk, :]
 
         # Compare either raw deltas or cumulative actions, then emit either a
         # single chunk-level reward or a per-action reward sequence.
         chunk_rewards = torch.zeros(self.num_envs, chunk_size, dtype=torch.float32)
-        if self.reward_granularity == "per_action":
-            per_action_rewards = self._reward_fn(
-                pred, gt, per_action=True
-            ) * self.reward_coef  # [num_envs, min_chunk]
-            chunk_rewards[:, :min_chunk] = per_action_rewards
-            env_rewards = per_action_rewards.sum(dim=1)  # [num_envs]
+        per_action = self.reward_granularity == "per_action"
+        if self.reward_type == "improvement":
+            if base is None:
+                raise ValueError(
+                    "DatasetEnv reward_type='improvement' requires action payload "
+                    "containing 'base_actions'."
+                )
+            reward_stats = compose_reward(
+                base_actions=base,
+                final_actions=pred,
+                gt_actions=gt,
+                delta_actions=delta,
+                error_fn=self.error_fn,
+                residual_penalty_type=self.residual_penalty_type,
+                residual_coef=self.residual_coef,
+                per_action=per_action,
+            )
+            reward_values = reward_stats["reward"] * self.reward_coef
+            if per_action:
+                chunk_rewards[:, :min_chunk] = reward_values
+                env_rewards = reward_values.sum(dim=1)
+            else:
+                chunk_rewards[:, -1] = reward_values
+                env_rewards = reward_values
         else:
-            chunk_pred, chunk_gt = self._get_chunk_level_reward_inputs(pred, gt)
-            env_rewards = (
-                self._reward_fn(chunk_pred, chunk_gt) * self.reward_coef
-            )  # [num_envs]
-            chunk_rewards[:, -1] = env_rewards
+            reward_stats = None
+            if per_action:
+                per_action_rewards = self._reward_fn(
+                    pred, gt, per_action=True
+                ) * self.reward_coef
+                chunk_rewards[:, :min_chunk] = per_action_rewards
+                env_rewards = per_action_rewards.sum(dim=1)
+            else:
+                chunk_pred, chunk_gt = self._get_chunk_level_reward_inputs(pred, gt)
+                env_rewards = (
+                    self._reward_fn(chunk_pred, chunk_gt) * self.reward_coef
+                )
+                chunk_rewards[:, -1] = env_rewards
 
         # Update elapsed steps
         self._elapsed_steps += chunk_size
@@ -988,6 +1044,19 @@ class DatasetEnv:
         step_reward_np = env_rewards.numpy()
         infos = {}
         infos = self._record_metrics(step_reward_np, terminations, infos)
+        final_mae = compute_error(pred, gt, error_fn="mae", per_action=False)
+        infos["episode"]["final_mae"] = final_mae.cpu()
+        if base is not None:
+            base_mae = compute_error(base, gt, error_fn="mae", per_action=False)
+            infos["episode"]["base_mae"] = base_mae.cpu()
+            infos["episode"]["improvement"] = (base_mae - final_mae).cpu()
+        if delta is not None:
+            delta_norm = delta.abs().mean(dim=(1, 2))
+            infos["episode"]["delta_norm"] = delta_norm.cpu()
+        if reward_stats is not None and self.reward_type == "improvement":
+            infos["episode"]["adapter_penalty"] = reward_stats["penalty"].reshape(
+                self.num_envs, -1
+            ).mean(dim=-1).cpu()
 
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)

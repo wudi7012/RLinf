@@ -29,4 +29,13 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             f"Please check ...model.version or implement the corresponding model loader."
         )
 
-    return get_model(cfg, torch_dtype)
+    model = get_model(cfg, torch_dtype)
+    adapter_cfg = cfg.get("adapter", None)
+    if adapter_cfg is not None and adapter_cfg.get("enable", False):
+        from rlinf.models.vla_adapter.residual_chunk_adapter import (
+            ResidualChunkAdapterPolicy,
+        )
+
+        model = ResidualChunkAdapterPolicy(model, cfg)
+
+    return model

@@ -508,6 +508,13 @@ class MultiStepRolloutWorker(Worker):
         Returns:
             A list of action shards aligned with destination rank order.
         """
+        if isinstance(actions, dict):
+            split_payloads = [dict() for _ in sizes]
+            for key, value in actions.items():
+                split_values = self._split_actions(value, sizes)
+                for idx, split_value in enumerate(split_values):
+                    split_payloads[idx][key] = split_value
+            return split_payloads
         assert sum(sizes) == actions.shape[0], (
             f"Number of actions ({actions.shape[0]}) must equal split sizes sum ({sum(sizes)})."
         )
@@ -551,13 +558,21 @@ class MultiStepRolloutWorker(Worker):
         for (dst_rank, _), chunk_action_i in zip(
             dst_ranks_and_sizes, chunk_actions_split
         ):
-            if isinstance(chunk_action_i, torch.Tensor):
-                chunk_action_i = chunk_action_i.detach().cpu()
+            chunk_action_i = self._move_actions_to_cpu(chunk_action_i)
             output_channel.put(
                 chunk_action_i,
                 key=CommMapper.build_channel_key(self._rank, dst_rank, extra=mode),
                 async_op=True,
             )
+
+    def _move_actions_to_cpu(self, actions):
+        if isinstance(actions, torch.Tensor):
+            return actions.detach().cpu()
+        if isinstance(actions, dict):
+            return {
+                key: self._move_actions_to_cpu(value) for key, value in actions.items()
+            }
+        return actions
 
     def get_actor_split_num(self):
         send_num = self.placement.get_world_size("rollout") * self.num_pipeline_stages

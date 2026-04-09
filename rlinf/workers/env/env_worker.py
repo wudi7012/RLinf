@@ -327,6 +327,29 @@ class EnvWorker(Worker):
         Returns:
             Concatenated action chunk array with shape ``[num_envs_per_stage, ...]``.
         """
+
+        def _to_numpy_payload(item):
+            if isinstance(item, torch.Tensor):
+                return item.detach().cpu().numpy()
+            if isinstance(item, dict):
+                return {key: _to_numpy_payload(value) for key, value in item.items()}
+            return np.asarray(item)
+
+        def _payload_batch_size(item):
+            if isinstance(item, dict):
+                for value in item.values():
+                    return _payload_batch_size(value)
+                raise ValueError("Cannot infer batch size from empty action payload.")
+            return item.shape[0]
+
+        def _concat_payload(items):
+            first = items[0]
+            if isinstance(first, dict):
+                return {
+                    key: _concat_payload([item[key] for item in items]) for key in first
+                }
+            return np.concatenate(items, axis=0)
+
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         src_ranks_and_sizes = self.src_ranks[mode]
         chunk_action = []
@@ -334,19 +357,17 @@ class EnvWorker(Worker):
             action_i = input_channel.get(
                 key=CommMapper.build_channel_key(src_rank, self._rank, extra=mode),
             )
-            if isinstance(action_i, torch.Tensor):
-                action_i = action_i.detach().cpu().numpy()
-            else:
-                action_i = np.asarray(action_i)
-            assert action_i.shape[0] == expected_size, (
+            action_i = _to_numpy_payload(action_i)
+            assert _payload_batch_size(action_i) == expected_size, (
                 f"Expected action shard size {expected_size} from rollout rank {src_rank}, "
-                f"got shape {action_i.shape}."
+                f"got payload batch size {_payload_batch_size(action_i)}."
             )
             chunk_action.append(action_i)
-        chunk_action = np.concatenate(chunk_action, axis=0)
+        chunk_action = _concat_payload(chunk_action)
         expected_total_size = sum(size for _, size in src_ranks_and_sizes)
-        assert chunk_action.shape[0] == expected_total_size, (
-            f"Expected concatenated action size {expected_total_size}, got {chunk_action.shape[0]}."
+        assert _payload_batch_size(chunk_action) == expected_total_size, (
+            f"Expected concatenated action size {expected_total_size}, "
+            f"got {_payload_batch_size(chunk_action)}."
         )
         return chunk_action
 

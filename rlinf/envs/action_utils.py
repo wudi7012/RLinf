@@ -204,6 +204,32 @@ def prepare_actions(
     policy: str = "widowx_bridge",
     wm_env_type=None,
 ) -> torch.Tensor | np.ndarray:
+    if isinstance(raw_chunk_actions, dict):
+        prepared_payload = dict(raw_chunk_actions)
+        if "actions" in prepared_payload:
+            prepared_payload["actions"] = prepare_actions(
+                raw_chunk_actions=prepared_payload["actions"],
+                env_type=env_type,
+                model_type=model_type,
+                num_action_chunks=num_action_chunks,
+                action_dim=action_dim,
+                action_scale=action_scale,
+                policy=policy,
+                wm_env_type=wm_env_type,
+            )
+        if "base_actions" in prepared_payload:
+            prepared_payload["base_actions"] = prepare_actions(
+                raw_chunk_actions=prepared_payload["base_actions"],
+                env_type=env_type,
+                model_type=model_type,
+                num_action_chunks=num_action_chunks,
+                action_dim=action_dim,
+                action_scale=action_scale,
+                policy=policy,
+                wm_env_type=wm_env_type,
+            )
+        return prepared_payload
+
     env_type = SupportedEnvType(env_type)
     if env_type == SupportedEnvType.LIBERO:
         chunk_actions = prepare_actions_for_libero(
