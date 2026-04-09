@@ -15,7 +15,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 4,5
+    actor,env,rollout: 0,2
 
 runner:
   task_type: embodied
@@ -33,7 +33,7 @@ runner:
   save_interval: 25
 
   resume_dir: null
-  ckpt_path: null
+  ckpt_path: '/workspace/RLinf/logs/20260330-10:35:05-libero_sft/libero_sft_openvlaoft/checkpoints/global_step_5000/actor/model_state_dict/full_weights.pt'
 
 algorithm:
   normalize_advantages: True

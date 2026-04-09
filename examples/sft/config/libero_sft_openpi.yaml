@@ -13,23 +13,25 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0-0
+    actor,env,rollout: 4-5
 
 runner:
   task_type: sft
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "test_openpi"
+    experiment_name: "libero_sft_openpi"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 30000
+  max_epochs: 10000
   max_steps: -1
   val_check_interval: -1
-  save_interval: 2000
+  save_interval: 5000
 
 data:
-  train_data_paths: "/path/to/libero-data"
+  train_data_paths: "/workspace/data/lerobot_home"
+  dataset_name: "libero_130_custom"
+  custom_val_ratio: 0.0
 
 algorithm:
   adv_type: gae
@@ -38,17 +40,17 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 4
-  global_batch_size: 128
+  global_batch_size: 64
   seed: 0
 
   # Override the default values in model/pi0
   model:
     precision: null
-    model_path: "/path/to/pi0-model"
-    num_action_chunks: 4 # interface for the env
+    model_path: "/workspace/data/model/RLinf-Pi05-LIBERO-SFT"
+    num_action_chunks: 4
     add_value_head: True
     openpi:
-      config_name: "pi0_libero"
+      config_name: "pi05_libero"
       detach_critic_input: True
 
   optim:
