@@ -15,7 +15,6 @@
 """Extract frozen-VLA features and deterministic base actions for adapters."""
 
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 

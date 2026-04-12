@@ -95,7 +95,7 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
 
         self.action_dim = base_vla.action_dim
         self.num_action_chunks = base_vla.num_action_chunks
-        self.proprio_dim = _get_cfg_value(cfg, "proprio_dim", self.action_dim)
+        self.proprio_dim = self._infer_proprio_dim(cfg, base_vla)
         self.residual_bound = float(
             _get_cfg_value(self.adapter_cfg, "residual_bound", 0.5)
         )
@@ -119,6 +119,19 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
                 _get_cfg_value(self.adapter_cfg, "init_log_std", -2.0)
             ),
         )
+        base_param = next(self.base_vla.parameters())
+        self.adapter_actor.to(device=base_param.device, dtype=base_param.dtype)
+
+    def __getattr__(self, name: str):
+        """Delegate missing attributes to the wrapped base VLA."""
+        try:
+            return super().__getattr__(name)
+        except AttributeError as exc:
+            modules = object.__getattribute__(self, "_modules")
+            base_vla = modules.get("base_vla")
+            if base_vla is not None and hasattr(base_vla, name):
+                return getattr(base_vla, name)
+            raise exc
 
     def _freeze_base_vla(self) -> None:
         freeze_backbone = bool(_get_cfg_value(self.vla_cfg, "freeze_backbone", True))
@@ -137,6 +150,52 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
                     param.requires_grad = False
         self.base_vla.eval()
 
+    def train(self, mode: bool = True):
+        """Keep the frozen VLA in eval mode while training the adapter."""
+        super().train(mode)
+        self.base_vla.eval()
+        return self
+
+    def gradient_checkpointing_enable(self, *args, **kwargs):
+        if hasattr(self.base_vla, "gradient_checkpointing_enable"):
+            return self.base_vla.gradient_checkpointing_enable(*args, **kwargs)
+        return None
+
+    def gradient_checkpointing_disable(self, *args, **kwargs):
+        if hasattr(self.base_vla, "gradient_checkpointing_disable"):
+            return self.base_vla.gradient_checkpointing_disable(*args, **kwargs)
+        return None
+
+    def enable_torch_compile(
+        self,
+        mode: str = "max-autotune-no-cudagraphs",
+    ):
+        if hasattr(self.base_vla, "enable_torch_compile"):
+            return self.base_vla.enable_torch_compile(mode=mode)
+        raise NotImplementedError(
+            "torch compile is not supported for the wrapped base VLA"
+        )
+
+    def capture_cuda_graph(self, train_batch_size: int, eval_batch_size: int):
+        if hasattr(self.base_vla, "capture_cuda_graph"):
+            return self.base_vla.capture_cuda_graph(
+                train_batch_size=train_batch_size,
+                eval_batch_size=eval_batch_size,
+            )
+        raise NotImplementedError(
+            "cuda graph is not supported for the wrapped base VLA"
+        )
+
+    def release_cuda_graph(self):
+        if hasattr(self.base_vla, "release_cuda_graph"):
+            return self.base_vla.release_cuda_graph()
+        return None
+
+    def is_cuda_graph_enabled(self) -> bool:
+        if hasattr(self.base_vla, "is_cuda_graph_enabled"):
+            return bool(self.base_vla.is_cuda_graph_enabled())
+        return False
+
     def _infer_feature_dim(self) -> int:
         if hasattr(self.base_vla, "hidden_size"):
             return int(self.base_vla.hidden_size)
@@ -148,6 +207,19 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
             f"Unable to infer feature dimension from backbone {type(self.base_vla).__name__}"
         )
 
+    def _infer_proprio_dim(self, cfg, base_vla: nn.Module) -> int:
+        configured_dim = _get_cfg_value(cfg, "proprio_dim", None)
+        if configured_dim is not None:
+            return int(configured_dim)
+        if hasattr(base_vla, "proprio_dim"):
+            return int(base_vla.proprio_dim)
+        if hasattr(base_vla, "config") and hasattr(base_vla.config, "proprio_dim"):
+            return int(base_vla.config.proprio_dim)
+        raise ValueError(
+            "ResidualChunkAdapterPolicy requires an explicit proprio/state dimension. "
+            "Please set `actor.model.proprio_dim` in the config."
+        )
+
     def _build_adapter_inputs(
         self,
         features: torch.Tensor,
@@ -155,9 +227,14 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
         base_actions: torch.Tensor,
     ) -> torch.Tensor:
         base_actions_flat = base_actions.flatten(start_dim=1)
-        return torch.cat(
+        adapter_inputs = torch.cat(
             [features, states.to(dtype=features.dtype), base_actions_flat.to(features.dtype)],
             dim=-1,
+        )
+        adapter_param = next(self.adapter_actor.parameters())
+        return adapter_inputs.to(
+            device=adapter_param.device,
+            dtype=adapter_param.dtype,
         )
 
     def _sample_delta(

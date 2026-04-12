@@ -15,22 +15,22 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 2-5
+    actor,env,rollout: 2,3
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_grpo_openvlaoft_offline"
+    experiment_name: "libero_grpo_openvlaoft_offline_2gpu_min"
     logger_backends: ["tensorboard"]
 
   max_epochs: 10
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 5
-  save_interval: 5
+  val_check_interval: -1
+  save_interval: 20
 
   resume_dir: null
   ckpt_path: null
@@ -39,7 +39,7 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl
 
-  group_size: 8
+  group_size: 4
   rollout_epoch: 4
   eval_rollout_epoch: 1
 
@@ -85,7 +85,7 @@ env:
 
   train:
     data_path: "/workspace/data/dataset/data"
-    total_num_envs: 32
+    total_num_envs: 8
     max_steps_per_rollout_epoch: 8
     max_episode_steps: 8
     reward_fn: mae
@@ -98,7 +98,7 @@ env:
     chunk_size: 8
   eval:
     data_path: "/workspace/data/dataset/data"
-    total_num_envs: 8
+    total_num_envs: 2
     auto_reset: False
     ignore_terminations: False
     max_episode_steps: 8
@@ -127,8 +127,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 16
-  global_batch_size: 64
+  micro_batch_size: 1
+  global_batch_size: 4
   seed: 1234
   enable_offload: True
 
