@@ -204,6 +204,21 @@ class EnvWorker(Worker):
                 if self.enable_offload and hasattr(self.env_list[i], "offload"):
                     self.env_list[i].offload()
 
+    def _maybe_extract_env_actions(self, chunk_actions, env_type: str):
+        """Unwrap structured adapter payloads for envs that only accept raw actions.
+
+        Offline DatasetEnv consumes the full payload so it can compute improvement
+        rewards against ``base_actions`` / ``delta_actions``. Online simulators only
+        need the final action tensor, so pass through ``payload["actions"]``.
+        """
+        if env_type == "dataset_env" or not isinstance(chunk_actions, dict):
+            return chunk_actions
+        if "actions" not in chunk_actions:
+            raise KeyError(
+                "Structured action payload for online env is missing the `actions` key."
+            )
+        return chunk_actions["actions"]
+
     @Worker.timer("env_interact_step")
     def env_interact_step(
         self, chunk_actions: torch.Tensor, stage_id: int
@@ -219,6 +234,9 @@ class EnvWorker(Worker):
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),
             wm_env_type=self.cfg.env.train.get("wm_env_type", None),
+        )
+        chunk_actions = self._maybe_extract_env_actions(
+            chunk_actions, env_type=self.cfg.env.train.env_type
         )
         env_info = {}
 
@@ -284,6 +302,9 @@ class EnvWorker(Worker):
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),
+        )
+        chunk_actions = self._maybe_extract_env_actions(
+            chunk_actions, env_type=self.cfg.env.eval.env_type
         )
         env_info = {}
 

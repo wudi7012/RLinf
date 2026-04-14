@@ -15,7 +15,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 4,5
+    actor,env,rollout: all
 
 runner:
   task_type: embodied
@@ -33,7 +33,8 @@ runner:
   save_interval: 25
 
   resume_dir: null
-  ckpt_path: /workspace/RLinf/logs/20260326-16:16:36/libero_sft_openvlaoft/checkpoints/global_step_5000/actor/model_state_dict/full_weights.pt
+  ckpt_path: null
+
 algorithm:
   normalize_advantages: True
   kl_penalty: kl
@@ -83,10 +84,10 @@ env:
 
   # Required by rollout worker init even in eval-only mode (train_batch_size calc)
   train:
-    total_num_envs: 500
+    total_num_envs: 512
 
   eval:
-    total_num_envs: 14
+    total_num_envs: 32
     auto_reset: True
     ignore_terminations: True
     group_size: 1
@@ -107,7 +108,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora/"
+    model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
     precision: ${actor.model.precision}
 
 actor:
@@ -119,7 +120,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora/"
+    model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
     model_type: "openvla_oft"
     unnorm_key: libero_130_no_noops_trajall
     max_prompt_length: 128
