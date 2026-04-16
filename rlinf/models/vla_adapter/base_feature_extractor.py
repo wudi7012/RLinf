@@ -43,6 +43,16 @@ def _pool_hidden_states(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states.mean(dim=1)
 
 
+def _to_base_action_tensor(
+    base_actions: np.ndarray | torch.Tensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    if isinstance(base_actions, np.ndarray):
+        return torch.from_numpy(base_actions).to(device=device, dtype=torch.float32)
+    return base_actions.to(device=device, dtype=torch.float32)
+
+
 def _prepare_rlinf_inputs(base_model, env_obs: dict[str, Any]) -> dict[str, torch.Tensor]:
     task_descriptions = [
         f"In: What action should the robot take to {t.lower()}?\nOut: "
@@ -300,6 +310,23 @@ def extract_features_from_env_obs(base_model, env_obs: dict[str, Any]) -> VLAAda
     )
 
 
+def attach_base_actions(
+    extracted: VLAAdapterFeatures,
+    base_actions: np.ndarray | torch.Tensor,
+) -> VLAAdapterFeatures:
+    """Override deterministic base actions with externally supplied rollout actions."""
+    base_actions_t = _to_base_action_tensor(
+        base_actions,
+        device=extracted.features.device,
+    )
+    return VLAAdapterFeatures(
+        features=extracted.features,
+        base_actions=base_actions_t,
+        states=extracted.states,
+        forward_inputs=extracted.forward_inputs,
+    )
+
+
 def extract_features_from_forward_inputs(
     base_model,
     forward_inputs: dict[str, torch.Tensor],
@@ -312,8 +339,9 @@ def extract_features_from_forward_inputs(
     vla_inputs = {
         key: value
         for key, value in forward_inputs.items()
-        if key not in {"states", "delta_pre_tanh", "action"}
+        if key not in {"states", "delta_pre_tanh", "action", "base_actions"}
     }
+    cached_base_actions = forward_inputs.get("base_actions")
     if "proprio" in vla_inputs:
         features, base_actions = _extract_official_from_forward_inputs(
             base_model, vla_inputs
@@ -321,6 +349,11 @@ def extract_features_from_forward_inputs(
     else:
         features, base_actions = _extract_rlinf_from_forward_inputs(
             base_model, vla_inputs
+        )
+    if cached_base_actions is not None:
+        base_actions = _to_base_action_tensor(
+            cached_base_actions,
+            device=features.device,
         )
     return VLAAdapterFeatures(
         features=features.to(dtype=torch.float32),

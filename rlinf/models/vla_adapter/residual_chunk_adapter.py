@@ -23,6 +23,7 @@ import torch.nn as nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.vla_adapter.base_feature_extractor import (
+    attach_base_actions,
     extract_features_from_env_obs,
     extract_features_from_forward_inputs,
 )
@@ -269,7 +270,16 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         del calculate_values
         deterministic = not kwargs.get("do_sample", True)
-        extracted = extract_features_from_env_obs(self.base_vla, env_obs)
+        base_chunk_actions, base_result = self.base_vla.predict_action_batch(
+            env_obs=env_obs,
+            calculate_logprobs=False,
+            calculate_values=False,
+            **kwargs,
+        )
+        extracted = attach_base_actions(
+            extract_features_from_env_obs(self.base_vla, env_obs),
+            base_chunk_actions,
+        )
         adapter_inputs = self._build_adapter_inputs(
             extracted.features,
             extracted.states,
@@ -288,8 +298,9 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
         base_actions = extracted.base_actions.to(dtype=torch.float32)
 
         forward_inputs = {
-            **extracted.forward_inputs,
+            **base_result["forward_inputs"],
             "states": extracted.states.to(dtype=torch.float32),
+            "base_actions": base_actions,
             "delta_pre_tanh": delta_pre_tanh.view_as(base_actions).to(dtype=torch.float32),
             "action": final_actions,
         }
