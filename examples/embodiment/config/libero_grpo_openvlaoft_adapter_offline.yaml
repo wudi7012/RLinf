@@ -15,7 +15,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 4-7
+    actor,env,rollout: all
 
 runner:
   task_type: embodied
@@ -29,8 +29,8 @@ runner:
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 150
-  save_interval: 150
+  val_check_interval: 250
+  save_interval: 250
 
   resume_dir: null
   ckpt_path: null
@@ -176,7 +176,7 @@ adapter:
   init_log_std: -2.0
 
 adapter_reward:
-  type: abs
+  type: absolute
   error_fn: mae
   residual_penalty: l1
   residual_coef: 0.01

@@ -33,7 +33,7 @@ runner:
   save_interval: 25
 
   resume_dir: null
-  ckpt_path: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260414-06:37:29-libero_grpo_openvlaoft_adapter_offline/libero_grpo_openvlaoft_offline/checkpoints/global_step_150/actor/model_state_dict/full_weights.pt  # Set to .../actor/model_state_dict/full_weights.pt
+  ckpt_path: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260415-06:34:32-libero_grpo_openvlaoft_adapter_offline_absolute/libero_grpo_openvlaoft_adapter_offline/checkpoints/global_step_200/actor/model_state_dict/full_weights.pt
 
 algorithm:
   normalize_advantages: True
@@ -65,7 +65,7 @@ algorithm:
   sampling_params:
     do_sample: True
     temperature_train: 1.6
-    temperature_eval: -1
+    temperature_eval: 1.6
     top_k: -1
     top_p: 1.0
     repetition_penalty: 1.0
@@ -92,7 +92,7 @@ env:
     ignore_terminations: True
     group_size: 1
     max_episode_steps: 512
-    max_steps_per_rollout_epoch: 4096
+    max_steps_per_rollout_epoch: 2048
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
     reset_gripper_open: False
@@ -152,12 +152,12 @@ critic:
   use_critic_model: False
 
 adapter:
-  enable: true
+  enable: True
   type: residual_chunk_adapter
   hidden_dim: 512
   num_layers: 3
   use_layernorm: true
-  residual_bound: 0.5
+  residual_bound: 0
   std_mode: global_learnable
   init_log_std: -2.0
 
