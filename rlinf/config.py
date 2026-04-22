@@ -29,6 +29,7 @@ from omegaconf.dictconfig import DictConfig
 from rlinf.algorithms.offline_rl import (
     SUPPORTED_OFFLINE_RL_ALGOS,
     get_offline_rl_algo_name,
+    is_pure_offline_dataset_enabled,
 )
 from rlinf.envs import SupportedEnvType
 from rlinf.scheduler.cluster import Cluster
@@ -718,6 +719,7 @@ def validate_embodied_cfg(cfg):
         use_adapter_offline_rl = bool(
             adapter_cfg is not None and adapter_cfg.get("enable", False)
         )
+        use_pure_offline_rl = is_pure_offline_dataset_enabled(cfg)
 
         def _get_offpolicy_head_flag(flag_name: str, default: bool = False) -> bool:
             if use_adapter_offline_rl:
@@ -750,9 +752,11 @@ def validate_embodied_cfg(cfg):
         assert cfg.algorithm.group_size == 1, (
             "embodied_sac / offline RL currently requires algorithm.group_size == 1."
         )
-        assert cfg.rollout.get("collect_transitions", False), (
-            "embodied_sac / offline RL requires rollout.collect_transitions=True."
-        )
+        if not use_pure_offline_rl:
+            assert cfg.rollout.get("collect_transitions", False), (
+                "embodied_sac / offline RL requires rollout.collect_transitions=True "
+                "unless algorithm.offline_rl.dataset.enable=True."
+            )
         if use_adapter_offline_rl:
             assert cfg.actor.model.model_type == "openvla_oft", (
                 "Classic offline RL on the current adapter path is implemented for "
@@ -765,6 +769,15 @@ def validate_embodied_cfg(cfg):
             action_space = str(adapter_cfg.get("offline_rl_action_space", "residual"))
             assert action_space in {"residual", "final"}, (
                 "adapter.offline_rl_action_space must be one of ['residual', 'final']."
+            )
+        if use_pure_offline_rl:
+            dataset_cfg = cfg.algorithm.offline_rl.dataset
+            assert dataset_cfg.get("dataset_root", None) is not None, (
+                "Pure offline RL requires algorithm.offline_rl.dataset.dataset_root."
+            )
+            assert use_adapter_offline_rl, (
+                "The current pure offline LIBERO integration is implemented for "
+                "openvla_oft with adapter.enable=True."
             )
         assert _get_offpolicy_head_flag("add_q_head", False), (
             "embodied_sac / offline RL requires a Q head. Set actor.model.add_q_head=True "
@@ -826,7 +839,10 @@ def validate_embodied_cfg(cfg):
             "env.eval.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
 
-    if not cfg.runner.only_eval:
+    if not cfg.runner.only_eval and not (
+        cfg.algorithm.loss_type == "embodied_sac"
+        and is_pure_offline_dataset_enabled(cfg)
+    ):
         assert cfg.env.train.total_num_envs > 0, (
             "Total number of parallel environments for training must be greater than 0"
         )

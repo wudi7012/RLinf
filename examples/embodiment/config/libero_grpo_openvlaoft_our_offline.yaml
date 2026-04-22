@@ -15,22 +15,22 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 2,3
+    actor,env,rollout: all
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_grpo_openvlaoft_offline_2gpu_min"
+    experiment_name: "libero_grpo_openvlaoft_our_offline"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 10
+  max_epochs: 1000
   max_steps: -1
 
   only_eval: False
-  val_check_interval: -1
-  save_interval: 20
+  val_check_interval: 250
+  save_interval: 250
 
   resume_dir: null
   ckpt_path: null
@@ -39,8 +39,8 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl
 
-  group_size: 4
-  rollout_epoch: 4
+  group_size: 8
+  rollout_epoch: 2
   eval_rollout_epoch: 1
 
   reward_type: action_level
@@ -84,29 +84,30 @@ env:
   group_name: "EnvGroup"
 
   train:
-    data_path: "/workspace/data/dataset/data"
-    total_num_envs: 8
+    data_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/dataset/pi_libero/data"
+    total_num_envs: 64
     max_steps_per_rollout_epoch: 8
     max_episode_steps: 8
     reward_fn: mae
+    reward_type: absolute
     reward_coef: ${algorithm.reward_coef}
-    reward_type: ${adapter_reward.type}
-    error_fn: ${adapter_reward.error_fn}
-    residual_penalty: ${adapter_reward.residual_penalty}
-    residual_coef: ${adapter_reward.residual_coef}
+    reward_action_mode: delta
+    reward_granularity: per_action
     group_size: ${algorithm.group_size}
     chunk_size: 8
   eval:
-    data_path: "/workspace/data/dataset/data"
-    total_num_envs: 2
+    data_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/dataset/pi_libero/data"
+    total_num_envs: 8
     auto_reset: False
     ignore_terminations: False
     max_episode_steps: 8
     max_steps_per_rollout_epoch: 8
-    reward_type: ${adapter_reward.type}
-    error_fn: ${adapter_reward.error_fn}
-    residual_penalty: ${adapter_reward.residual_penalty}
-    residual_coef: ${adapter_reward.residual_coef}
+    reward_fn: mae
+    reward_type: absolute
+    reward_coef: ${algorithm.reward_coef}
+    reward_action_mode: delta
+    reward_granularity: per_action
+    chunk_size: 8
     group_size: 1
     is_eval: True
     video_cfg:
@@ -121,25 +122,23 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora/"
+    model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 1
-  global_batch_size: 4
+  micro_batch_size: 16
+  global_batch_size: 64
   seed: 1234
   enable_offload: True
 
   model:
-    model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora/"
+    model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
     model_type: "openvla_oft"
     unnorm_key: libero_130_no_noops_trajall
     proprio_dim: 8
     max_prompt_length: 128
-    adapter: ${adapter}
-    vla: ${vla}
 
   optim:
     lr: 2.0e-5
@@ -164,25 +163,3 @@ reward:
 
 critic:
   use_critic_model: False
-
-adapter:
-  enable: true
-  type: residual_chunk_adapter
-  hidden_dim: 512
-  num_layers: 3
-  use_layernorm: true
-  residual_bound: 0.5
-  std_mode: global_learnable
-  init_log_std: -2.0
-
-adapter_reward:
-  type: improvement
-  error_fn: mae
-  residual_penalty: l1
-  residual_coef: 0.01
-
-vla:
-  freeze_backbone: true
-  freeze_action_head: true
-  feature_type: pooled_last_hidden
-  use_base_action: true

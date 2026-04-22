@@ -1,0 +1,51 @@
+defaults:
+  - libero_cql_openvlaoft_adapter_offline
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 2,3
+
+runner:
+  logger:
+    experiment_name: "libero_cql_openvlaoft_adapter_offline_2gpu_min"
+
+  max_epochs: 10
+  log_interval: 5
+  save_interval: 50
+  val_check_interval: -1
+
+algorithm:
+  update_epoch: 4
+
+  replay_buffer:
+    cache_size: 512
+    sample_window_size: 512
+
+  offline_rl:
+    dataset:
+      preprocess_batch_size: 4
+      shard_by_rank: true
+
+actor:
+  micro_batch_size: 1
+  global_batch_size: 4
+  enable_offload: true
+
+  optim:
+    clip_grad: 1.0
+
+  critic_optim:
+    clip_grad: 10.0
+
+  fsdp_config:
+    gradient_checkpointing: true
+
+rollout:
+  enable_offload: true
+
+env:
+  train:
+    total_num_envs: 1
+  eval:
+    total_num_envs: 2

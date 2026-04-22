@@ -15,22 +15,22 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: all
+    actor,env,rollout: 2,3
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_grpo_openvlaoft_adapter_offline"
+    experiment_name: "libero_grpo_openvlaoft_our_offline_2gpu_min"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 1000
+  max_epochs: 10
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 250
-  save_interval: 250
+  val_check_interval: -1
+  save_interval: 20
 
   resume_dir: null
   ckpt_path: null
@@ -39,8 +39,8 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl
 
-  group_size: 8
-  rollout_epoch: 2
+  group_size: 4
+  rollout_epoch: 4
   eval_rollout_epoch: 1
 
   reward_type: action_level
@@ -84,8 +84,8 @@ env:
   group_name: "EnvGroup"
 
   train:
-    data_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/dataset/pi_libero/data"
-    total_num_envs: 64
+    data_path: "/workspace/data/dataset/data"
+    total_num_envs: 8
     max_steps_per_rollout_epoch: 8
     max_episode_steps: 8
     reward_fn: mae
@@ -97,8 +97,8 @@ env:
     group_size: ${algorithm.group_size}
     chunk_size: 8
   eval:
-    data_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/dataset/pi_libero/data"
-    total_num_envs: 8
+    data_path: "/workspace/data/dataset/data"
+    total_num_envs: 2
     auto_reset: False
     ignore_terminations: False
     max_episode_steps: 8
@@ -121,19 +121,19 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
+    model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora/"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 16
-  global_batch_size: 64
+  micro_batch_size: 1
+  global_batch_size: 4
   seed: 1234
   enable_offload: True
 
   model:
-    model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
+    model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora/"
     model_type: "openvla_oft"
     unnorm_key: libero_130_no_noops_trajall
     proprio_dim: 8
@@ -176,7 +176,7 @@ adapter:
   init_log_std: -2.0
 
 adapter_reward:
-  type: absolute
+  type: improvement
   error_fn: mae
   residual_penalty: l1
   residual_coef: 0.01

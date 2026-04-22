@@ -22,7 +22,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_grpo_openvlaoft_offline"
+    experiment_name: "libero_grpo_openvlaoft_adapter_our_offline"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1000
@@ -89,10 +89,11 @@ env:
     max_steps_per_rollout_epoch: 8
     max_episode_steps: 8
     reward_fn: mae
-    reward_type: absolute
     reward_coef: ${algorithm.reward_coef}
-    reward_action_mode: delta
-    reward_granularity: per_action
+    reward_type: ${adapter_reward.type}
+    error_fn: ${adapter_reward.error_fn}
+    residual_penalty: ${adapter_reward.residual_penalty}
+    residual_coef: ${adapter_reward.residual_coef}
     group_size: ${algorithm.group_size}
     chunk_size: 8
   eval:
@@ -102,12 +103,10 @@ env:
     ignore_terminations: False
     max_episode_steps: 8
     max_steps_per_rollout_epoch: 8
-    reward_fn: mae
-    reward_type: absolute
-    reward_coef: ${algorithm.reward_coef}
-    reward_action_mode: delta
-    reward_granularity: per_action
-    chunk_size: 8
+    reward_type: ${adapter_reward.type}
+    error_fn: ${adapter_reward.error_fn}
+    residual_penalty: ${adapter_reward.residual_penalty}
+    residual_coef: ${adapter_reward.residual_coef}
     group_size: 1
     is_eval: True
     video_cfg:
@@ -139,6 +138,8 @@ actor:
     unnorm_key: libero_130_no_noops_trajall
     proprio_dim: 8
     max_prompt_length: 128
+    adapter: ${adapter}
+    vla: ${vla}
 
   optim:
     lr: 2.0e-5
@@ -163,3 +164,25 @@ reward:
 
 critic:
   use_critic_model: False
+
+adapter:
+  enable: true
+  type: residual_chunk_adapter
+  hidden_dim: 512
+  num_layers: 3
+  use_layernorm: true
+  residual_bound: 0.5
+  std_mode: global_learnable
+  init_log_std: -2.0
+
+adapter_reward:
+  type: absolute
+  error_fn: mae
+  residual_penalty: l1
+  residual_coef: 0.01
+
+vla:
+  freeze_backbone: true
+  freeze_action_head: true
+  feature_type: pooled_last_hidden
+  use_base_action: true

@@ -25,6 +25,16 @@ def get_offline_rl_algo_name(cfg) -> str:
     return offline_cfg.get("name", "sac").lower()
 
 
+def is_pure_offline_dataset_enabled(cfg) -> bool:
+    offline_cfg = cfg.algorithm.get("offline_rl", None)
+    if offline_cfg is None:
+        return False
+    dataset_cfg = offline_cfg.get("dataset", None)
+    if dataset_cfg is None:
+        return False
+    return bool(dataset_cfg.get("enable", False))
+
+
 def iql_expectile_loss(diff: torch.Tensor, expectile: float) -> torch.Tensor:
     weight = torch.where(diff >= 0, expectile, 1.0 - expectile)
     return (weight * diff.square()).mean()

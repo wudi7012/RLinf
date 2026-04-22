@@ -162,7 +162,7 @@ def phase2(args):
 
     GlobalHydra.instance().clear()
     with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
-        cfg = compose(config_name="libero_grpo_openvlaoft_offline")
+        cfg = compose(config_name="libero_grpo_openvlaoft_our_offline")
 
     print("[1/2] Config loaded successfully.")
     print(f"  env.train.env_type    = {cfg.env.train.env_type}")

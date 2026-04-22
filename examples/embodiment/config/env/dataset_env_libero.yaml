@@ -23,7 +23,7 @@ error_fn: mae          # mae / mse / cosine (used by improvement reward)
 residual_penalty: none # none / l1 / l2
 residual_coef: 0.0
 reward_action_mode: delta  # delta / cumulative
-reward_granularity: per_action # per_action if using grpo_per_action, chunk if using grpo (see @libero_grpo_openvlaoft_offline.yaml (50-51))
+reward_granularity: per_action # per_action if using grpo_per_action, chunk if using grpo (see @libero_grpo_openvlaoft_our_offline.yaml (50-51))
 
 # Dataset keys (parquet default: actions, state, image)
 action_key: actions        # key for ground-truth actions

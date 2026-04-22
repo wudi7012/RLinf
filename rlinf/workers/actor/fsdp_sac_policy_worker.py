@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import copy
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -26,8 +26,12 @@ from rlinf.algorithms.offline_rl import (
     get_offline_rl_algo_name,
     iql_advantage_weights,
     iql_expectile_loss,
+    is_pure_offline_dataset_enabled,
 )
 from rlinf.config import SupportedModel
+from rlinf.data.datasets.libero_offline_rl import (
+    build_libero_chunk_offline_dataset_from_cfg,
+)
 from rlinf.data.embodied_buffer_dataset import (
     PreloadReplayBufferDataset,
     ReplayBufferDataset,
@@ -66,6 +70,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.update_step = 0
         self.enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
         self.offline_rl_name = get_offline_rl_algo_name(cfg)
+        self.use_pure_offline_dataset = is_pure_offline_dataset_enabled(cfg)
 
     def init_worker(self):
         self.setup_model_and_optimizer(initialize_target=True)
@@ -284,6 +289,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         self.buffer_dataloader_iter = iter(self.buffer_dataloader)
 
+        if self.use_pure_offline_dataset:
+            self._preload_pure_offline_replay_buffer()
+
         self.critic_actor_ratio = self.cfg.algorithm.get("critic_actor_ratio", 1)
         self.critic_subsample_size = self.cfg.algorithm.get("critic_subsample_size", -1)
         self.critic_sample_generator = torch.Generator(self.device)
@@ -292,6 +300,179 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.target_update_type = self.cfg.algorithm.get("target_update_type", "all")
         assert self.target_update_type in ["all", "q_head_only"], (
             f"{self.target_update_type=} is not suppported!"
+        )
+
+    def _pure_offline_dataset_cfg(self):
+        return self.cfg.algorithm.offline_rl.dataset
+
+    def _slice_env_obs_batch(
+        self,
+        env_obs: dict[str, Any],
+        start: int,
+        end: int,
+    ) -> dict[str, Any]:
+        sliced: dict[str, Any] = {}
+        for key, value in env_obs.items():
+            if isinstance(value, torch.Tensor):
+                sliced[key] = value[start:end].clone()
+            elif isinstance(value, list):
+                sliced[key] = list(value[start:end])
+            else:
+                sliced[key] = copy.deepcopy(value)
+        return sliced
+
+    def _transition_obs_to_cpu(
+        self, transition_obs: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return {
+            key: value.detach().cpu().contiguous()
+            for key, value in transition_obs.items()
+        }
+
+    def _concat_transition_obs_parts(
+        self, obs_parts: list[dict[str, torch.Tensor]]
+    ) -> dict[str, torch.Tensor]:
+        if not obs_parts:
+            return {}
+        return {
+            key: torch.cat([part[key] for part in obs_parts], dim=0).contiguous()
+            for key in obs_parts[0].keys()
+        }
+
+    def _build_pure_offline_transition_kwargs(self) -> dict[str, Any]:
+        dataset_cfg = self._pure_offline_dataset_cfg()
+        sampling_cfg = self.cfg.algorithm.sampling_params
+
+        do_sample = bool(dataset_cfg.get("base_do_sample", sampling_cfg.get("do_sample", True)))
+        temperature = float(
+            dataset_cfg.get("base_temperature", sampling_cfg.get("temperature_train", 1.0))
+        )
+        if temperature <= 0:
+            do_sample = False
+            temperature = 1.0
+
+        kwargs: dict[str, Any] = {"do_sample": do_sample}
+        if SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.OPENVLA,
+            SupportedModel.OPENVLA_OFT,
+        ]:
+            kwargs.update(
+                {
+                    "temperature": temperature,
+                    "top_k": int(dataset_cfg.get("base_top_k", sampling_cfg.get("top_k", -1))),
+                    "top_p": float(dataset_cfg.get("base_top_p", sampling_cfg.get("top_p", 1.0))),
+                    "repetition_penalty": float(
+                        dataset_cfg.get(
+                            "base_repetition_penalty",
+                            sampling_cfg.get("repetition_penalty", 1.0),
+                        )
+                    ),
+                }
+            )
+        return kwargs
+
+    def _build_pure_offline_trajectory(
+        self,
+        curr_obs: dict[str, torch.Tensor],
+        next_obs: dict[str, torch.Tensor],
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        terminations: torch.Tensor,
+        truncations: torch.Tensor,
+        dones: torch.Tensor,
+        max_episode_length: int,
+    ) -> Trajectory:
+        trajectory = Trajectory(
+            max_episode_length=max_episode_length,
+            model_weights_id="offline_dataset",
+            actions=actions.unsqueeze(1).cpu().contiguous(),
+            rewards=rewards.unsqueeze(1).cpu().contiguous(),
+            terminations=terminations.unsqueeze(1).cpu().contiguous(),
+            truncations=truncations.unsqueeze(1).cpu().contiguous(),
+            dones=dones.unsqueeze(1).cpu().contiguous(),
+            curr_obs={
+                key: value.unsqueeze(1).cpu().contiguous()
+                for key, value in curr_obs.items()
+            },
+            next_obs={
+                key: value.unsqueeze(1).cpu().contiguous()
+                for key, value in next_obs.items()
+            },
+        )
+        return trajectory
+
+    def _preload_pure_offline_replay_buffer(self):
+        dataset = build_libero_chunk_offline_dataset_from_cfg(self.cfg)
+        dataset_cfg = self._pure_offline_dataset_cfg()
+        preprocess_batch_size = int(dataset_cfg.get("preprocess_batch_size", 32))
+        shard_by_rank = bool(dataset_cfg.get("shard_by_rank", True))
+        transition_kwargs = self._build_pure_offline_transition_kwargs()
+
+        local_episode_count = 0
+        local_transition_count = 0
+        skipped_episode_count = 0
+
+        self.log_on_first_rank(
+            f"Prefilling replay buffer from pure offline LIBERO dataset at {dataset.dataset_root}."
+        )
+        self.model.eval()
+        for episode_offset in range(len(dataset)):
+            episode = dataset.load_episode(episode_offset)
+            if episode is None:
+                skipped_episode_count += 1
+                continue
+
+            local_store = (episode_offset % self._world_size == self._rank) if shard_by_rank else True
+            curr_obs_parts: list[dict[str, torch.Tensor]] = []
+            next_obs_parts: list[dict[str, torch.Tensor]] = []
+
+            num_transitions = int(episode.actions.shape[0])
+            for start in range(0, num_transitions, preprocess_batch_size):
+                end = min(start + preprocess_batch_size, num_transitions)
+                curr_env_obs = self._slice_env_obs_batch(episode.curr_env_obs, start, end)
+                next_env_obs = self._slice_env_obs_batch(episode.next_env_obs, start, end)
+
+                with torch.no_grad():
+                    curr_transition_obs = self.model.build_transition_obs(
+                        env_obs=curr_env_obs,
+                        **transition_kwargs,
+                    )
+                    next_transition_obs = self.model.build_transition_obs(
+                        env_obs=next_env_obs,
+                        **transition_kwargs,
+                    )
+
+                if local_store:
+                    curr_obs_parts.append(self._transition_obs_to_cpu(curr_transition_obs))
+                    next_obs_parts.append(self._transition_obs_to_cpu(next_transition_obs))
+
+            if not local_store:
+                continue
+
+            trajectory = self._build_pure_offline_trajectory(
+                curr_obs=self._concat_transition_obs_parts(curr_obs_parts),
+                next_obs=self._concat_transition_obs_parts(next_obs_parts),
+                actions=episode.actions,
+                rewards=episode.rewards,
+                terminations=episode.terminations,
+                truncations=episode.truncations,
+                dones=episode.dones,
+                max_episode_length=episode.max_episode_length,
+            )
+            self.replay_buffer.add_trajectories([trajectory])
+            local_episode_count += 1
+            local_transition_count += episode.max_episode_length
+
+            if local_episode_count == 1 or local_episode_count % 100 == 0:
+                self.log_info(
+                    f"Pure offline preload: rank={self._rank} "
+                    f"episodes={local_episode_count} transitions={local_transition_count}"
+                )
+
+        self.log_info(
+            f"Pure offline preload finished on rank={self._rank}: "
+            f"episodes={local_episode_count} transitions={local_transition_count} "
+            f"skipped={skipped_episode_count}"
         )
 
     def _build_sac_forward_kwargs(self) -> dict:

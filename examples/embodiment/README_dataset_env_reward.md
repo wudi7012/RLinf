@@ -9,7 +9,7 @@ reward_action_mode: delta
 reward_granularity: chunk
 ```
 
-RLinf 侧改 [libero_grpo_openvlaoft_offline.yaml](/home/wudi/src/RLinf/examples/embodiment/config/libero_grpo_openvlaoft_offline.yaml)：
+RLinf 侧改 [libero_grpo_openvlaoft_our_offline.yaml](/home/wudi/src/RLinf/examples/embodiment/config/libero_grpo_openvlaoft_our_offline.yaml)：
 
 ```yaml
 algorithm:
@@ -29,7 +29,7 @@ reward_action_mode: cumulative
 reward_granularity: chunk
 ```
 
-RLinf 侧改 [libero_grpo_openvlaoft_offline.yaml](/home/wudi/src/RLinf/examples/embodiment/config/libero_grpo_openvlaoft_offline.yaml)：
+RLinf 侧改 [libero_grpo_openvlaoft_our_offline.yaml](/home/wudi/src/RLinf/examples/embodiment/config/libero_grpo_openvlaoft_our_offline.yaml)：
 
 ```yaml
 algorithm:
@@ -49,7 +49,7 @@ reward_action_mode: delta
 reward_granularity: per_action
 ```
 
-RLinf 侧改 [libero_grpo_openvlaoft_offline.yaml](/home/wudi/src/RLinf/examples/embodiment/config/libero_grpo_openvlaoft_offline.yaml)：
+RLinf 侧改 [libero_grpo_openvlaoft_our_offline.yaml](/home/wudi/src/RLinf/examples/embodiment/config/libero_grpo_openvlaoft_our_offline.yaml)：
 
 ```yaml
 algorithm:
@@ -69,7 +69,7 @@ reward_action_mode: cumulative
 reward_granularity: per_action
 ```
 
-RLinf 侧改 [libero_grpo_openvlaoft_offline.yaml](/home/wudi/src/RLinf/examples/embodiment/config/libero_grpo_openvlaoft_offline.yaml)：
+RLinf 侧改 [libero_grpo_openvlaoft_our_offline.yaml](/home/wudi/src/RLinf/examples/embodiment/config/libero_grpo_openvlaoft_our_offline.yaml)：
 
 ```yaml
 algorithm:

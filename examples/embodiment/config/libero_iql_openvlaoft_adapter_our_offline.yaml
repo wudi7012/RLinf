@@ -1,12 +1,11 @@
 defaults:
-  - libero_cql_openvlaoft_adapter_offline
+  - libero_cql_openvlaoft_adapter_our_offline
 
 runner:
   logger:
-    experiment_name: "libero_iql_openvlaoft_adapter_offline"
+    experiment_name: "libero_iql_openvlaoft_adapter_our_offline"
 
 algorithm:
-  backup_entropy: False
   offline_rl:
     name: iql
     iql:
