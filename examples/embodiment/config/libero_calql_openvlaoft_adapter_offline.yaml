@@ -1,0 +1,22 @@
+defaults:
+  - libero_cql_openvlaoft_adapter_offline
+
+runner:
+  logger:
+    experiment_name: "libero_calql_openvlaoft_adapter_offline"
+
+algorithm:
+  offline_rl:
+    name: calql
+    cql:
+      alpha_type: exp
+      initial_alpha: 1.0
+      alpha_threshold: 10.0
+      conservative_weight: 5.0
+      n_action_samples: 10
+      optim:
+        lr: 1.0e-4
+        lr_scheduler: torch_constant
+        clip_grad: 10.0
+    calql:
+      returns_to_go_gamma: 1.0

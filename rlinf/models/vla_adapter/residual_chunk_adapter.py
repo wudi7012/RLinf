@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.modules.q_head import MultiQHead
+from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.models.vla_adapter.base_feature_extractor import (
     attach_base_actions,
     extract_features_from_env_obs,
@@ -96,10 +98,19 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
 
         self.action_dim = base_vla.action_dim
         self.num_action_chunks = base_vla.num_action_chunks
+        self.flat_action_dim = self.num_action_chunks * self.action_dim
         self.proprio_dim = self._infer_proprio_dim(cfg, base_vla)
         self.residual_bound = float(
             _get_cfg_value(self.adapter_cfg, "residual_bound", 0.5)
         )
+        self.offline_rl_action_space = str(
+            _get_cfg_value(self.adapter_cfg, "offline_rl_action_space", "residual")
+        )
+        if self.offline_rl_action_space not in {"residual", "final"}:
+            raise ValueError(
+                "ResidualChunkAdapterPolicy only supports "
+                "`adapter.offline_rl_action_space` in ['residual', 'final']."
+            )
 
         self._freeze_base_vla()
 
@@ -107,9 +118,10 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
         adapter_input_dim = feature_dim + self.proprio_dim + (
             self.num_action_chunks * self.action_dim
         )
+        self.adapter_input_dim = adapter_input_dim
         self.adapter_actor = ResidualGaussianActor(
             input_dim=adapter_input_dim,
-            output_dim=self.num_action_chunks * self.action_dim,
+            output_dim=self.flat_action_dim,
             hidden_dim=int(_get_cfg_value(self.adapter_cfg, "hidden_dim", 512)),
             num_layers=int(_get_cfg_value(self.adapter_cfg, "num_layers", 3)),
             use_layernorm=bool(_get_cfg_value(self.adapter_cfg, "use_layernorm", True)),
@@ -120,8 +132,37 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
                 _get_cfg_value(self.adapter_cfg, "init_log_std", -2.0)
             ),
         )
+
+        q_hidden_dims = list(
+            _get_cfg_value(self.adapter_cfg, "q_head_hidden_dims", [512, 256, 256])
+        )
+        if bool(_get_cfg_value(self.adapter_cfg, "add_q_head", False)):
+            q_head_type = str(_get_cfg_value(self.adapter_cfg, "q_head_type", "default"))
+            if q_head_type != "default":
+                raise ValueError(
+                    "ResidualChunkAdapterPolicy currently supports only "
+                    "`adapter.q_head_type=default`."
+                )
+            self.q_head = MultiQHead(
+                hidden_size=adapter_input_dim,
+                action_feature_dim=self.flat_action_dim,
+                hidden_dims=q_hidden_dims,
+                num_q_heads=int(_get_cfg_value(self.adapter_cfg, "num_q_heads", 2)),
+            )
+        value_hidden_dims = tuple(
+            _get_cfg_value(self.adapter_cfg, "value_head_hidden_dims", [512, 256])
+        )
+        if bool(_get_cfg_value(self.adapter_cfg, "add_value_head", False)):
+            self.value_head = ValueHead(
+                input_dim=adapter_input_dim,
+                hidden_sizes=value_hidden_dims,
+                output_dim=1,
+                activation=str(
+                    _get_cfg_value(self.adapter_cfg, "value_head_activation", "gelu")
+                ),
+            )
         base_param = next(self.base_vla.parameters())
-        self.adapter_actor.to(device=base_param.device, dtype=base_param.dtype)
+        self.to(device=base_param.device, dtype=base_param.dtype)
 
     def __getattr__(self, name: str):
         """Delegate missing attributes to the wrapped base VLA."""
@@ -238,6 +279,127 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
             dtype=adapter_param.dtype,
         )
 
+    def _get_transition_obs_from_forward_inputs(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        return {
+            key: value
+            for key, value in forward_inputs.items()
+            if key not in {"delta_pre_tanh", "action"}
+        }
+
+    @torch.no_grad()
+    def build_transition_obs(
+        self,
+        env_obs: Optional[dict[str, Any]] = None,
+        forward_inputs: Optional[dict[str, torch.Tensor]] = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        if forward_inputs is not None:
+            return self._get_transition_obs_from_forward_inputs(forward_inputs)
+
+        if env_obs is None:
+            raise ValueError("build_transition_obs requires either env_obs or forward_inputs.")
+
+        base_chunk_actions, base_result = self.base_vla.predict_action_batch(
+            env_obs=env_obs,
+            calculate_logprobs=False,
+            calculate_values=False,
+            **kwargs,
+        )
+        states = env_obs["states"]
+        if not isinstance(states, torch.Tensor):
+            states = torch.as_tensor(states)
+        device = next(self.base_vla.parameters()).device
+        states = states.to(device=device, dtype=torch.float32)
+        base_actions = torch.as_tensor(
+            base_chunk_actions,
+            device=device,
+            dtype=torch.float32,
+        )
+        transition_obs = {
+            **base_result["forward_inputs"],
+            "states": states,
+            "base_actions": base_actions,
+        }
+        return transition_obs
+
+    def _extract_adapter_context(
+        self,
+        obs: dict[str, torch.Tensor],
+        **kwargs,
+    ):
+        if "input_ids" in obs:
+            return extract_features_from_forward_inputs(self.base_vla, obs)
+        base_chunk_actions, _ = self.base_vla.predict_action_batch(
+            env_obs=obs,
+            calculate_logprobs=False,
+            calculate_values=False,
+            **kwargs,
+        )
+        return attach_base_actions(
+            extract_features_from_env_obs(self.base_vla, obs),
+            base_chunk_actions,
+        )
+
+    def _delta_to_policy_action(
+        self,
+        delta_actions: torch.Tensor,
+        base_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        delta_actions = delta_actions.view(base_actions.shape[0], -1)
+        if self.offline_rl_action_space == "residual":
+            return delta_actions
+        base_actions = base_actions.flatten(start_dim=1).to(dtype=delta_actions.dtype)
+        return base_actions + delta_actions
+
+    def _policy_action_to_delta(
+        self,
+        policy_actions: torch.Tensor,
+        base_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        policy_actions = policy_actions.view(policy_actions.shape[0], -1)
+        if self.offline_rl_action_space == "residual":
+            return policy_actions
+        base_flat = base_actions.flatten(start_dim=1).to(dtype=policy_actions.dtype)
+        return policy_actions - base_flat
+
+    def _delta_from_pre_tanh(self, delta_pre_tanh: torch.Tensor) -> torch.Tensor:
+        return self.residual_bound * torch.tanh(delta_pre_tanh)
+
+    def _invert_policy_action(
+        self,
+        policy_actions: torch.Tensor,
+        base_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.residual_bound <= 0:
+            raise ValueError(
+                "IQL/CQL log-prob computation requires adapter.residual_bound > 0."
+            )
+        delta_actions = self._policy_action_to_delta(policy_actions, base_actions)
+        normalized = (delta_actions / self.residual_bound).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+        return torch.atanh(normalized)
+
+    def _compute_logprob_from_policy_action(
+        self,
+        policy_actions: torch.Tensor,
+        mean: torch.Tensor,
+        log_std: torch.Tensor,
+        base_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        delta_pre_tanh = self._invert_policy_action(policy_actions, base_actions).to(
+            device=mean.device,
+            dtype=mean.dtype,
+        )
+        _, _, logprobs, _ = self._sample_delta(
+            mean,
+            log_std,
+            deterministic=False,
+            delta_pre_tanh=delta_pre_tanh,
+        )
+        return logprobs
+
     def _sample_delta(
         self,
         mean: torch.Tensor,
@@ -296,13 +458,16 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
         final_actions = final_actions.to(dtype=torch.float32)
         delta_actions = delta_actions.view_as(extracted.base_actions).to(dtype=torch.float32)
         base_actions = extracted.base_actions.to(dtype=torch.float32)
+        policy_actions = self._delta_to_policy_action(delta_actions, base_actions).to(
+            dtype=torch.float32
+        )
 
         forward_inputs = {
             **base_result["forward_inputs"],
             "states": extracted.states.to(dtype=torch.float32),
             "base_actions": base_actions,
             "delta_pre_tanh": delta_pre_tanh.view_as(base_actions).to(dtype=torch.float32),
-            "action": final_actions,
+            "action": policy_actions,
         }
         result = {
             "prev_logprobs": logprobs.to(dtype=torch.float32),
@@ -330,6 +495,14 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
+        if forward_type == ForwardType.SAC:
+            return self.sac_forward(**kwargs)
+        if forward_type == ForwardType.SAC_Q:
+            return self.sac_q_forward(**kwargs)
+        if forward_type == ForwardType.IQL_V:
+            return self.iql_v_forward(**kwargs)
+        if forward_type == ForwardType.IQL_LOGPROB:
+            return self.iql_logprob_forward(**kwargs)
         raise NotImplementedError
 
     def default_forward(
@@ -371,3 +544,67 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
                 dtype=torch.float32,
             )
         return result
+
+    def sac_forward(self, obs, **kwargs):
+        extracted = self._extract_adapter_context(obs, **kwargs)
+        adapter_inputs = self._build_adapter_inputs(
+            extracted.features,
+            extracted.states,
+            extracted.base_actions,
+        )
+        mean, log_std = self.adapter_actor(adapter_inputs)
+        _, delta_actions, logprobs, _ = self._sample_delta(
+            mean,
+            log_std,
+            deterministic=False,
+        )
+        policy_actions = self._delta_to_policy_action(delta_actions, extracted.base_actions)
+        return policy_actions, logprobs, None
+
+    def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False, **kwargs):
+        del shared_feature
+        if not hasattr(self, "q_head"):
+            raise NotImplementedError(
+                "Offline RL on ResidualChunkAdapterPolicy requires adapter.add_q_head=True."
+            )
+        extracted = self._extract_adapter_context(obs, **kwargs)
+        adapter_inputs = self._build_adapter_inputs(
+            extracted.features,
+            extracted.states,
+            extracted.base_actions,
+        )
+        if detach_encoder:
+            adapter_inputs = adapter_inputs.detach()
+        flat_actions = actions.view(actions.shape[0], -1).to(
+            device=adapter_inputs.device,
+            dtype=adapter_inputs.dtype,
+        )
+        return self.q_head(adapter_inputs, flat_actions)
+
+    def iql_v_forward(self, obs, **kwargs):
+        if not hasattr(self, "value_head"):
+            raise NotImplementedError(
+                "IQL on ResidualChunkAdapterPolicy requires adapter.add_value_head=True."
+            )
+        extracted = self._extract_adapter_context(obs, **kwargs)
+        adapter_inputs = self._build_adapter_inputs(
+            extracted.features,
+            extracted.states,
+            extracted.base_actions,
+        )
+        return self.value_head(adapter_inputs)
+
+    def iql_logprob_forward(self, obs, actions, **kwargs):
+        extracted = self._extract_adapter_context(obs, **kwargs)
+        adapter_inputs = self._build_adapter_inputs(
+            extracted.features,
+            extracted.states,
+            extracted.base_actions,
+        )
+        mean, log_std = self.adapter_actor(adapter_inputs)
+        return self._compute_logprob_from_policy_action(
+            actions,
+            mean=mean,
+            log_std=log_std,
+            base_actions=extracted.base_actions,
+        )

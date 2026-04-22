@@ -285,6 +285,43 @@ class MultiStepRolloutWorker(Worker):
 
         return dones, rewards
 
+    def _get_sampling_kwargs_for_mode(
+        self, mode: Literal["train", "eval"] = "train"
+    ) -> dict[str, Any]:
+        return (
+            dict(self._train_sampling_params)
+            if mode == "train"
+            else dict(self._eval_sampling_params)
+        )
+
+    def _prepare_transition_obs_from_result(
+        self,
+        result: dict[str, Any],
+        raw_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+    ) -> dict[str, Any]:
+        if hasattr(self.hf_model, "build_transition_obs"):
+            return self.hf_model.build_transition_obs(
+                forward_inputs=result["forward_inputs"],
+            )
+        raw_obs = dict(raw_obs)
+        raw_obs.pop("task_descriptions", None)
+        return raw_obs
+
+    def _prepare_transition_obs_from_env(
+        self,
+        env_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+    ) -> dict[str, Any]:
+        if hasattr(self.hf_model, "build_transition_obs"):
+            return self.hf_model.build_transition_obs(
+                env_obs=env_obs,
+                **self._get_sampling_kwargs_for_mode(mode),
+            )
+        env_obs = dict(env_obs)
+        env_obs.pop("task_descriptions", None)
+        return env_obs
+
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
         param_state_dict = await self.recv(
@@ -313,7 +350,7 @@ class MultiStepRolloutWorker(Worker):
 
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
-        last_obs = [None for i in range(self.num_pipeline_stages)]
+        last_transition_obs = [None for i in range(self.num_pipeline_stages)]
         for _ in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
@@ -327,6 +364,25 @@ class MultiStepRolloutWorker(Worker):
                 dones, rewards = self.get_dones_and_rewards(env_output)
 
                 actions, result = self.predict(env_output["obs"])
+                current_transition_obs = None
+                if self.collect_transitions:
+                    current_transition_obs = self._prepare_transition_obs_from_result(
+                        result,
+                        env_output["obs"],
+                        mode="train",
+                    )
+
+                next_obs_env = (
+                    env_output["final_obs"]
+                    if dones.any() and self.cfg.env.train.auto_reset
+                    else env_output["obs"]
+                )
+                next_transition_obs = None
+                if self.collect_transitions and last_transition_obs[stage_id] is not None:
+                    next_transition_obs = self._prepare_transition_obs_from_env(
+                        next_obs_env,
+                        mode="train",
+                    )
 
                 env_output["obs"].pop("task_descriptions", None)
                 if env_output["final_obs"] is not None:
@@ -354,18 +410,14 @@ class MultiStepRolloutWorker(Worker):
                 )
 
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
-                if self.collect_transitions and last_obs[stage_id] is not None:
-                    curr_obs = last_obs[stage_id]
-                    next_obs = (
-                        env_output["final_obs"]
-                        if dones.any() and self.cfg.env.train.auto_reset
-                        else env_output["obs"]
-                    )
+                if self.collect_transitions and last_transition_obs[stage_id] is not None:
+                    curr_obs = last_transition_obs[stage_id]
+                    next_obs = next_transition_obs
                     self.rollout_results[stage_id].append_transitions(
                         curr_obs, next_obs
                     )
 
-                last_obs[stage_id] = env_output["obs"]
+                last_transition_obs[stage_id] = current_transition_obs
 
                 self.send_chunk_actions(output_channel, actions)
 
@@ -396,12 +448,16 @@ class MultiStepRolloutWorker(Worker):
             )
 
             self.rollout_results[stage_id].append_step_result(chunk_step_result)
-            if self.collect_transitions and last_obs[stage_id] is not None:
-                curr_obs = last_obs[stage_id]
-                next_obs = (
+            if self.collect_transitions and last_transition_obs[stage_id] is not None:
+                curr_obs = last_transition_obs[stage_id]
+                next_obs_env = (
                     env_output["final_obs"]
                     if dones.any() and self.cfg.env.train.auto_reset
                     else env_output["obs"]
+                )
+                next_obs = self._prepare_transition_obs_from_env(
+                    next_obs_env,
+                    mode="train",
                 )
                 self.rollout_results[stage_id].append_transitions(curr_obs, next_obs)
 

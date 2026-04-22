@@ -714,23 +714,79 @@ def validate_embodied_cfg(cfg):
         )
 
     if cfg.algorithm.loss_type == "embodied_sac":
+        adapter_cfg = cfg.actor.model.get("adapter", None)
+        use_adapter_offline_rl = bool(
+            adapter_cfg is not None and adapter_cfg.get("enable", False)
+        )
+
+        def _get_offpolicy_head_flag(flag_name: str, default: bool = False) -> bool:
+            if use_adapter_offline_rl:
+                return bool(adapter_cfg.get(flag_name, default))
+            return bool(cfg.actor.model.get(flag_name, default))
+
+        def _get_offpolicy_q_head_type() -> str:
+            if use_adapter_offline_rl:
+                return str(
+                    adapter_cfg.get(
+                        "q_head_type",
+                        cfg.algorithm.get(
+                            "q_head_type",
+                            cfg.actor.model.get("q_head_type", "default"),
+                        ),
+                    )
+                )
+            return str(
+                cfg.algorithm.get(
+                    "q_head_type",
+                    cfg.actor.model.get("q_head_type", "default"),
+                )
+            )
+
         offline_rl_name = get_offline_rl_algo_name(cfg)
         assert offline_rl_name in SUPPORTED_OFFLINE_RL_ALGOS, (
             f"Unsupported offline RL algorithm '{offline_rl_name}'. "
             f"Supported options: {sorted(SUPPORTED_OFFLINE_RL_ALGOS)}"
         )
+        assert cfg.algorithm.group_size == 1, (
+            "embodied_sac / offline RL currently requires algorithm.group_size == 1."
+        )
+        assert cfg.rollout.get("collect_transitions", False), (
+            "embodied_sac / offline RL requires rollout.collect_transitions=True."
+        )
+        if use_adapter_offline_rl:
+            assert cfg.actor.model.model_type == "openvla_oft", (
+                "Classic offline RL on the current adapter path is implemented for "
+                "actor.model.model_type='openvla_oft'."
+            )
+            assert adapter_cfg.get("type", "residual_chunk_adapter") == "residual_chunk_adapter", (
+                "Classic offline RL adapter integration currently supports "
+                "adapter.type='residual_chunk_adapter'."
+            )
+            action_space = str(adapter_cfg.get("offline_rl_action_space", "residual"))
+            assert action_space in {"residual", "final"}, (
+                "adapter.offline_rl_action_space must be one of ['residual', 'final']."
+            )
+        assert _get_offpolicy_head_flag("add_q_head", False), (
+            "embodied_sac / offline RL requires a Q head. Set actor.model.add_q_head=True "
+            "for standard policies, or adapter.add_q_head=True for VLA adapters."
+        )
         if offline_rl_name == "iql":
-            assert cfg.actor.model.get("add_q_head", False), (
-                "IQL requires actor.model.add_q_head=True."
+            assert _get_offpolicy_head_flag("add_q_head", False), (
+                "IQL requires a Q head. Set actor.model.add_q_head=True for "
+                "standard policies, or adapter.add_q_head=True for VLA adapters."
             )
-            assert cfg.actor.model.get("add_value_head", False), (
-                "IQL requires actor.model.add_value_head=True."
+            assert _get_offpolicy_head_flag("add_value_head", False), (
+                "IQL requires a value head. Set actor.model.add_value_head=True for "
+                "standard policies, or adapter.add_value_head=True for VLA adapters."
             )
-            assert cfg.actor.model.model_type in ["mlp_policy", "cnn_policy"], (
-                "IQL is currently supported for mlp_policy and cnn_policy in RLinf."
-            )
+            supported_iql_models = ["mlp_policy", "cnn_policy"]
+            if not use_adapter_offline_rl:
+                assert cfg.actor.model.model_type in supported_iql_models, (
+                    "IQL is currently supported for mlp_policy and cnn_policy, "
+                    "or for openvla_oft with adapter.enable=True."
+                )
         if offline_rl_name in {"cql", "calql", "iql"}:
-            assert cfg.actor.model.get("q_head_type", "default") != "crossq", (
+            assert _get_offpolicy_q_head_type() != "crossq", (
                 f"{offline_rl_name} is not currently supported with q_head_type='crossq'."
             )
 

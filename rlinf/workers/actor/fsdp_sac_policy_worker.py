@@ -328,6 +328,19 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             log_pi = log_pi.unsqueeze(-1)
         return log_pi.sum(dim=-1, keepdim=True)
 
+    def _get_cql_random_action_bounds(self) -> tuple[float, float]:
+        cql_cfg = self.cfg.algorithm.offline_rl.get("cql", {})
+        if "random_action_low" in cql_cfg and "random_action_high" in cql_cfg:
+            return float(cql_cfg.random_action_low), float(cql_cfg.random_action_high)
+
+        adapter_cfg = self.cfg.actor.model.get("adapter", None)
+        if adapter_cfg is not None and adapter_cfg.get("enable", False):
+            if adapter_cfg.get("offline_rl_action_space", "residual") == "residual":
+                residual_bound = float(adapter_cfg.get("residual_bound", 1.0))
+                return -residual_bound, residual_bound
+
+        return -1.0, 1.0
+
     def _aggregate_q_values(self, q_values: torch.Tensor, agg_q: str) -> torch.Tensor:
         if agg_q == "min":
             return torch.min(q_values, dim=1, keepdim=True).values
@@ -571,6 +584,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
 
         value_obs = self._repeat_nested_batch(curr_obs, n_action_samples)
+        next_value_obs = self._repeat_nested_batch(next_obs, n_action_samples)
         curr_action_values = self.model(
             forward_type=ForwardType.SAC_Q,
             obs=value_obs,
@@ -579,7 +593,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         next_action_values = self.model(
             forward_type=ForwardType.SAC_Q,
-            obs=value_obs,
+            obs=next_value_obs,
             actions=next_policy_actions.reshape(batch_size * n_action_samples, -1),
             **({"train": True} if self.use_dsrl else {}),
         )
@@ -593,12 +607,13 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         curr_log_pi = curr_log_pi.permute(2, 0, 1)
         next_log_pi = next_log_pi.permute(2, 0, 1)
 
+        random_action_low, random_action_high = self._get_cql_random_action_bounds()
         random_actions = torch.empty(
             batch_size * n_action_samples,
             batch["actions"].shape[-1],
             device=self.device,
             dtype=batch["actions"].dtype,
-        ).uniform_(-1.0, 1.0)
+        ).uniform_(random_action_low, random_action_high)
         random_values = self.model(
             forward_type=ForwardType.SAC_Q,
             obs=value_obs,
