@@ -26,6 +26,10 @@ import yaml
 from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
 
+from rlinf.algorithms.offline_rl import (
+    SUPPORTED_OFFLINE_RL_ALGOS,
+    get_offline_rl_algo_name,
+)
 from rlinf.envs import SupportedEnvType
 from rlinf.scheduler.cluster import Cluster
 from rlinf.utils.placement import (
@@ -708,6 +712,27 @@ def validate_embodied_cfg(cfg):
             f"actor.model.add_value_head must be True. "
             f"Current value: {add_value_head}"
         )
+
+    if cfg.algorithm.loss_type == "embodied_sac":
+        offline_rl_name = get_offline_rl_algo_name(cfg)
+        assert offline_rl_name in SUPPORTED_OFFLINE_RL_ALGOS, (
+            f"Unsupported offline RL algorithm '{offline_rl_name}'. "
+            f"Supported options: {sorted(SUPPORTED_OFFLINE_RL_ALGOS)}"
+        )
+        if offline_rl_name == "iql":
+            assert cfg.actor.model.get("add_q_head", False), (
+                "IQL requires actor.model.add_q_head=True."
+            )
+            assert cfg.actor.model.get("add_value_head", False), (
+                "IQL requires actor.model.add_value_head=True."
+            )
+            assert cfg.actor.model.model_type in ["mlp_policy", "cnn_policy"], (
+                "IQL is currently supported for mlp_policy and cnn_policy in RLinf."
+            )
+        if offline_rl_name in {"cql", "calql", "iql"}:
+            assert cfg.actor.model.get("q_head_type", "default") != "crossq", (
+                f"{offline_rl_name} is not currently supported with q_head_type='crossq'."
+            )
 
     # process num-envs
     component_placement = HybridComponentPlacement(

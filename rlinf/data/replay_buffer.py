@@ -240,6 +240,7 @@ class TrajectoryReplayBuffer:
         auto_save: bool = False,
         auto_save_path: str = "",
         trajectory_format: str = "pt",
+        returns_to_go_gamma: Optional[float] = None,
     ):
         """
         Initialize trajectory-based replay buffer.
@@ -257,6 +258,7 @@ class TrajectoryReplayBuffer:
         self.enable_cache = enable_cache
         self.sample_window_size = sample_window_size
         self.auto_save = auto_save
+        self.returns_to_go_gamma = returns_to_go_gamma
         self.logger = get_logger()
 
         if not self.auto_save:
@@ -748,7 +750,68 @@ class TrajectoryReplayBuffer:
                 if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
                     flat["forward_inputs"][key] = tensor.reshape(-1, *tensor.shape[2:])
 
+        if self.returns_to_go_gamma is not None:
+            returns_to_go = self._compute_returns_to_go(
+                trajectory, gamma=self.returns_to_go_gamma
+            )
+            flat["returns_to_go"] = returns_to_go.reshape(-1, *returns_to_go.shape[2:])
+
         return flat
+
+    def _align_done_like_tensor(
+        self, tensor: Optional[torch.Tensor], traj_len: int
+    ) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        if tensor.shape[0] == traj_len:
+            return tensor
+        extra = int(tensor.shape[0] - traj_len)
+        if extra <= 0:
+            return tensor[:traj_len]
+        assert traj_len % extra == 0, (
+            f"Trajectory length {traj_len} is not divisible by extra {extra} "
+            f"for done-like tensor with shape {tensor.shape}"
+        )
+        epoch_len = traj_len // extra
+        tensor = tensor.reshape(extra, epoch_len + 1, *tensor.shape[1:])[:, 1:]
+        return tensor.reshape(traj_len, *tensor.shape[2:])
+
+    def _compute_returns_to_go(
+        self, trajectory: Trajectory, gamma: float
+    ) -> torch.Tensor:
+        rewards = trajectory.rewards
+        assert rewards is not None, "returns_to_go requires trajectory.rewards."
+        if rewards.dim() == 2:
+            rewards = rewards.unsqueeze(-1)
+        rewards = rewards.to(torch.float32)
+
+        traj_len = rewards.shape[0]
+        done_tensor = None
+        for candidate in (trajectory.dones, trajectory.terminations, trajectory.truncations):
+            aligned = self._align_done_like_tensor(candidate, traj_len)
+            if aligned is not None:
+                done_tensor = aligned if done_tensor is None else (done_tensor | aligned)
+
+        if done_tensor is None:
+            done_tensor = torch.zeros(
+                rewards.shape[0],
+                rewards.shape[1],
+                1,
+                dtype=torch.bool,
+                device=rewards.device,
+            )
+        else:
+            if done_tensor.dim() == 2:
+                done_tensor = done_tensor.unsqueeze(-1)
+            done_tensor = done_tensor.to(dtype=torch.bool, device=rewards.device)
+
+        returns_to_go = torch.zeros_like(rewards, dtype=torch.float32)
+        running = torch.zeros_like(rewards[-1], dtype=torch.float32)
+        for step_id in range(traj_len - 1, -1, -1):
+            not_done = (~done_tensor[step_id]).to(torch.float32)
+            running = rewards[step_id] + gamma * running * not_done
+            returns_to_go[step_id] = running
+        return returns_to_go
 
     def _extract_chunk_from_flat_trajectory(
         self, flat_trajectory: dict, idx: int

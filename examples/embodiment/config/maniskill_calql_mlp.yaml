@@ -1,0 +1,12 @@
+defaults:
+  - maniskill_cql_mlp
+
+runner:
+  logger:
+    experiment_name: "calql_mlp"
+
+algorithm:
+  offline_rl:
+    name: calql
+    calql:
+      returns_to_go_gamma: 1.0

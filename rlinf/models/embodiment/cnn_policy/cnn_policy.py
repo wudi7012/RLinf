@@ -132,7 +132,6 @@ class CNNPolicy(nn.Module, BasePolicy):
                 nn.Linear(256, self.cfg.action_dim), std=0.01 * np.sqrt(2)
             )
 
-        assert self.cfg.add_value_head + self.cfg.add_q_head <= 1
         if self.cfg.add_value_head:
             self.value_head = ValueHead(
                 input_dim=256, hidden_sizes=(256, 256, 256), activation="relu"
@@ -272,10 +271,32 @@ class CNNPolicy(nn.Module, BasePolicy):
             return self.crossq_forward(**kwargs)
         elif forward_type == ForwardType.CROSSQ_Q:
             return self.crossq_q_forward(**kwargs)
+        elif forward_type == ForwardType.IQL_V:
+            return self.iql_v_forward(**kwargs)
+        elif forward_type == ForwardType.IQL_LOGPROB:
+            return self.iql_logprob_forward(**kwargs)
         elif forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
         else:
             raise NotImplementedError
+
+    def _get_actor_distribution_from_obs(
+        self, obs: dict[str, torch.Tensor]
+    ) -> tuple[Normal, torch.Tensor, torch.Tensor]:
+        full_feature, mix_feature, action_mean, action_logstd = (
+            self._actor_forward_from_processed_tensors(
+                obs["main_images"],
+                obs["states"],
+                obs.get("extra_view_images"),
+            )
+        )
+        action_std = torch.exp(action_logstd)
+        if self.cfg.std_range is not None:
+            action_std = torch.clamp(
+                action_std, self.cfg.std_range[0], self.cfg.std_range[1]
+            )
+        probs = Normal(action_mean, action_std)
+        return probs, full_feature, mix_feature
 
     def default_forward(
         self,
@@ -320,20 +341,7 @@ class CNNPolicy(nn.Module, BasePolicy):
         return output_dict
 
     def sac_forward(self, obs, **kwargs):
-        full_feature, mix_feature, action_mean, action_logstd = (
-            self._actor_forward_from_processed_tensors(
-                obs["main_images"],
-                obs["states"],
-                obs.get("extra_view_images"),
-            )
-        )
-        action_std = torch.exp(action_logstd)
-        if self.cfg.std_range is not None:
-            action_std = torch.clamp(
-                action_std, self.cfg.std_range[0], self.cfg.std_range[1]
-            )
-
-        probs = Normal(action_mean, action_std)
+        probs, full_feature, _ = self._get_actor_distribution_from_obs(obs)
         raw_action = probs.rsample()
 
         action_normalized = torch.tanh(raw_action)
@@ -345,6 +353,32 @@ class CNNPolicy(nn.Module, BasePolicy):
         )
 
         return action, chunk_logprobs, full_feature
+
+    def iql_v_forward(self, obs, **kwargs):
+        if not hasattr(self, "value_head"):
+            raise NotImplementedError(
+                "IQL requires actor.model.add_value_head=True to provide V(s)."
+            )
+        _, _, mix_feature = self._get_actor_distribution_from_obs(obs)
+        return self.value_head(mix_feature)
+
+    def iql_logprob_forward(self, obs, actions, **kwargs):
+        probs, _, _ = self._get_actor_distribution_from_obs(obs)
+        eps = 1e-6
+        if self.action_scale is not None:
+            action_normalized = (actions - self.action_bias) / self.action_scale
+        else:
+            action_normalized = actions
+        action_normalized = action_normalized.clamp(-1 + eps, 1 - eps)
+        raw_action = torch.atanh(action_normalized)
+        logprobs = probs.log_prob(raw_action)
+        if self.action_scale is not None:
+            logprobs = logprobs - torch.log(
+                self.action_scale * (1 - action_normalized.pow(2)) + eps
+            )
+        else:
+            logprobs = logprobs - torch.log(1 - action_normalized.pow(2) + eps)
+        return logprobs
 
     def _generate_actions(
         self,

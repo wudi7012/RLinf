@@ -1,0 +1,20 @@
+defaults:
+  - maniskill_sac_mlp
+
+runner:
+  logger:
+    experiment_name: "iql_mlp"
+
+algorithm:
+  backup_entropy: False
+  offline_rl:
+    name: iql
+    iql:
+      expectile: 0.7
+      weight_temp: 3.0
+      max_weight: 100.0
+
+actor:
+  model:
+    add_value_head: True
+    add_q_head: True

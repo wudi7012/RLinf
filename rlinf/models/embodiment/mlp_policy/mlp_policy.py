@@ -44,7 +44,6 @@ class MLPPolicy(nn.Module, BasePolicy):
         activation = "tanh"
         action_scale = None
 
-        assert add_value_head + add_q_head <= 1
         if add_value_head:
             self.value_head = ValueHead(
                 obs_dim, hidden_sizes=(256, 256, 256), activation=activation
@@ -123,22 +122,36 @@ class MLPPolicy(nn.Module, BasePolicy):
             return self.crossq_forward(**kwargs)
         elif forward_type == ForwardType.CROSSQ_Q:
             return self.crossq_q_forward(**kwargs)
+        elif forward_type == ForwardType.IQL_V:
+            return self.iql_v_forward(**kwargs)
+        elif forward_type == ForwardType.IQL_LOGPROB:
+            return self.iql_logprob_forward(**kwargs)
         elif forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
         else:
             raise NotImplementedError
 
-    def sac_forward(self, obs, **kwargs):
-        feat = self.backbone(obs["states"])
+    def _get_actor_distribution(
+        self, states: torch.Tensor
+    ) -> tuple[Normal, torch.Tensor, torch.Tensor, torch.Tensor]:
+        feat = self.backbone(states)
         action_mean = self.actor_mean(feat)
-        action_logstd = self.actor_logstd(feat)
-        action_logstd = torch.tanh(action_logstd)
-        action_logstd = self.logstd_range[0] + 0.5 * (
-            self.logstd_range[1] - self.logstd_range[0]
-        ) * (action_logstd + 1)
+        if self.independent_std:
+            action_logstd = self.actor_logstd.expand_as(action_mean)
+        else:
+            action_logstd = self.actor_logstd(feat)
+        if self.final_tanh:
+            action_logstd = torch.tanh(action_logstd)
+            action_logstd = self.logstd_range[0] + 0.5 * (
+                self.logstd_range[1] - self.logstd_range[0]
+            ) * (action_logstd + 1)
 
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
+        return probs, feat, action_mean, action_logstd
+
+    def sac_forward(self, obs, **kwargs):
+        probs, feat, _, _ = self._get_actor_distribution(obs["states"])
         raw_action = probs.rsample()
 
         action_normalized = torch.tanh(raw_action)
@@ -150,6 +163,33 @@ class MLPPolicy(nn.Module, BasePolicy):
         )
 
         return action, chunk_logprobs, None
+
+    def iql_v_forward(self, obs, **kwargs):
+        if not hasattr(self, "value_head"):
+            raise NotImplementedError(
+                "IQL requires actor.model.add_value_head=True to provide V(s)."
+            )
+        return self.value_head(obs["states"])
+
+    def iql_logprob_forward(self, obs, actions, **kwargs):
+        probs, _, _, _ = self._get_actor_distribution(obs["states"])
+        if self.final_tanh:
+            eps = 1e-6
+            if self.action_scale is not None:
+                action_normalized = (actions - self.action_bias) / self.action_scale
+            else:
+                action_normalized = actions
+            action_normalized = action_normalized.clamp(-1 + eps, 1 - eps)
+            raw_action = torch.atanh(action_normalized)
+            logprobs = probs.log_prob(raw_action)
+            if self.action_scale is not None:
+                logprobs = logprobs - torch.log(
+                    self.action_scale * (1 - action_normalized.pow(2)) + eps
+                )
+            else:
+                logprobs = logprobs - torch.log(1 - action_normalized.pow(2) + eps)
+            return logprobs
+        return probs.log_prob(actions)
 
     def default_forward(
         self,
