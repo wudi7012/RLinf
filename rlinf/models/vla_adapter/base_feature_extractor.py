@@ -332,10 +332,31 @@ def extract_features_from_forward_inputs(
     forward_inputs: dict[str, torch.Tensor],
 ) -> VLAAdapterFeatures:
     """Recompute deterministic frozen-VLA features from cached forward inputs."""
-    states = forward_inputs["states"].to(
-        device=next(base_model.parameters()).device,
-        dtype=torch.float32,
-    )
+    device = next(base_model.parameters()).device
+    states = forward_inputs["states"].to(device=device, dtype=torch.float32)
+    if "features" in forward_inputs:
+        cached_base_actions = forward_inputs.get("base_actions")
+        if cached_base_actions is None:
+            raise ValueError(
+                "Cached adapter forward inputs with `features` must also provide "
+                "`base_actions`."
+            )
+        features = forward_inputs["features"].to(device=device, dtype=torch.float32)
+        base_actions = _to_base_action_tensor(
+            cached_base_actions,
+            device=device,
+        )
+        cached_forward_inputs = {
+            key: value
+            for key, value in forward_inputs.items()
+            if key not in {"delta_pre_tanh", "action"}
+        }
+        return VLAAdapterFeatures(
+            features=features,
+            base_actions=base_actions.to(dtype=torch.float32),
+            states=states,
+            forward_inputs=cached_forward_inputs,
+        )
     vla_inputs = {
         key: value
         for key, value in forward_inputs.items()

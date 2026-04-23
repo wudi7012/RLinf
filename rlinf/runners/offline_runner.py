@@ -21,6 +21,7 @@ from typing import Any
 
 from omegaconf.dictconfig import DictConfig
 
+from rlinf.algorithms.offline_rl import is_pure_offline_dataset_enabled
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
@@ -47,6 +48,7 @@ class OfflineRunner:
 
         self.env_channel = Channel.create("Env")
         self.rollout_channel = Channel.create("Rollout")
+        self.use_pure_offline_dataset = is_pure_offline_dataset_enabled(cfg)
 
         self.global_step = 0
         self.set_max_steps()
@@ -98,6 +100,7 @@ class OfflineRunner:
                     "Evaluation is enabled but env/rollout worker groups are missing."
                 )
             self.env.init_worker().wait()
+        if self.rollout is not None:
             self.rollout.init_worker().wait()
         self.actor.init_worker().wait()
 
@@ -120,6 +123,33 @@ class OfflineRunner:
         actor_handle: Handle = self.actor.sync_model_to_rollout()
         actor_handle.wait()
         rollout_handle.wait()
+
+    def _prepare_pure_offline_batches_for_actor(self):
+        if not self.use_pure_offline_dataset:
+            return
+        if self.rollout is None:
+            raise RuntimeError(
+                "Pure offline training requires a rollout worker group to preprocess "
+                "adapter context batches."
+            )
+        update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
+        rollout_results = self.rollout.prepare_pure_offline_train_batches(
+            num_batches=update_epoch
+        ).wait()
+        actor_world_size = len(self.actor.worker_info_list)
+        rollout_world_size = len(rollout_results)
+        if rollout_world_size != actor_world_size:
+            raise RuntimeError(
+                "Pure offline preprocess currently requires rollout and actor world "
+                f"sizes to match, got rollout={rollout_world_size}, actor={actor_world_size}."
+            )
+        set_handles: list[Handle] = []
+        for rank, rank_batches in enumerate(rollout_results):
+            set_handles.append(
+                self.actor.execute_on(rank).set_pure_offline_batches(rank_batches)
+            )
+        for handle in set_handles:
+            handle.wait()
 
     def evaluate(self):
         if self.env is None or self.rollout is None:
@@ -215,15 +245,15 @@ class OfflineRunner:
             next_step = current_step + 1
             if not worker_step_synced:
                 self.actor.set_global_step(current_step)
+            if self.use_pure_offline_dataset:
+                self._prepare_pure_offline_batches_for_actor()
 
             with self.timer("step"):
                 actor_training_handle: Handle = self.actor.run_training()
                 actor_metrics_per_rank = actor_training_handle.wait()
                 if not isinstance(actor_metrics_per_rank, list):
                     actor_metrics_per_rank = [actor_metrics_per_rank]
-                _, actor_time_metrics_per_rank = (
-                    actor_training_handle.consume_durations(return_per_rank=True)
-                )
+                actor_time_metrics = actor_training_handle.consume_durations()
 
             ranked_actor_training_results = [
                 {"rank": rank, "train": rank_metrics}
@@ -270,11 +300,8 @@ class OfflineRunner:
 
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-            actor_time_metrics_agg = self._aggregate_numeric_metrics(
-                actor_time_metrics_per_rank
-            )
             time_metrics.update(
-                {f"time/actor/{k}": v for k, v in actor_time_metrics_agg.items()}
+                {f"time/actor/{k}": v for k, v in actor_time_metrics.items()}
             )
             training_metrics = {f"train/{k}": v for k, v in metrics.items()}
 
@@ -288,12 +315,6 @@ class OfflineRunner:
                     metrics_list=actor_training_metrics_per_rank,
                     step=self.global_step,
                     prefix="train",
-                    worker_group_name=self.actor.worker_group_name,
-                )
-                self._log_ranked_metrics(
-                    metrics_list=actor_time_metrics_per_rank,
-                    step=self.global_step,
-                    prefix="time/actor",
                     worker_group_name=self.actor.worker_group_name,
                 )
                 logging_metrics = dict(time_metrics)

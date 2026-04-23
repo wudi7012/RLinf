@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import os
 import sys
 import time
-from contextlib import nullcontext
 from typing import Any, Optional
 
 import numpy as np
@@ -24,7 +22,6 @@ import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 
 from rlinf.algorithms.offline_rl import (
     get_offline_rl_algo_name,
@@ -33,11 +30,6 @@ from rlinf.algorithms.offline_rl import (
     is_pure_offline_dataset_enabled,
 )
 from rlinf.config import SupportedModel
-from rlinf.data.datasets.libero_offline_rl import (
-    build_libero_chunk_offline_dataset_from_cfg,
-    build_libero_chunk_transition_dataset_from_cfg,
-    libero_offline_transition_collate_fn,
-)
 from rlinf.data.embodied_buffer_dataset import (
     PreloadReplayBufferDataset,
     ReplayBufferDataset,
@@ -84,6 +76,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.offline_data_iter = None
         self._offline_data_epoch = 0
         self._offline_data_iter_offset = 0
+        self._pure_offline_batches: list[dict[str, Any]] = []
 
     def init_worker(self):
         print(
@@ -300,7 +293,6 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
     def setup_sac_components(self):
         """Initialize SAC-specific components"""
         if self.use_pure_offline_dataset:
-            self.build_pure_offline_dataloader()
             self.critic_actor_ratio = self.cfg.algorithm.get("critic_actor_ratio", 1)
             self.critic_subsample_size = self.cfg.algorithm.get(
                 "critic_subsample_size", -1
@@ -405,426 +397,26 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             f"{self.target_update_type=} is not suppported!"
         )
 
-    def build_pure_offline_dataloader(self) -> None:
-        dataset_cfg = self._pure_offline_dataset_cfg()
-        per_rank_batch_size = self.cfg.actor.global_batch_size // self._world_size
-        if per_rank_batch_size < 1:
-            raise ValueError(
-                f"Per-rank offline batch size must be >= 1, got {per_rank_batch_size}."
-            )
-
-        self.offline_dataset = build_libero_chunk_transition_dataset_from_cfg(self.cfg)
-        if len(self.offline_dataset) < per_rank_batch_size:
-            raise ValueError(
-                f"Offline dataset size ({len(self.offline_dataset)}) must be >= "
-                f"per-rank batch size ({per_rank_batch_size})."
-            )
-
-        sampler = None
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            sampler = DistributedSampler(
-                self.offline_dataset,
-                num_replicas=self._world_size,
-                rank=self._rank,
-                shuffle=bool(dataset_cfg.get("shuffle", True)),
-                seed=int(dataset_cfg.get("seed", self.cfg.actor.get("seed", 1234))),
-                drop_last=True,
-            )
-
-        num_workers = int(dataset_cfg.get("num_workers", 0))
-        pin_memory = bool(dataset_cfg.get("pin_memory", True))
-        persistent_workers = num_workers > 0 and bool(
-            dataset_cfg.get("persistent_workers", True)
-        )
-
-        self.offline_data_loader = DataLoader(
-            self.offline_dataset,
-            batch_size=per_rank_batch_size,
-            sampler=sampler,
-            shuffle=(sampler is None),
-            num_workers=num_workers,
-            drop_last=True,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-            collate_fn=libero_offline_transition_collate_fn,
-        )
-        self._offline_data_epoch = 0
-        self._offline_data_iter_offset = 0
-        if sampler is not None:
-            sampler.set_epoch(self._offline_data_epoch)
-        self.offline_data_iter = iter(self.offline_data_loader)
-
+    def set_pure_offline_batches(self, batches: list[dict[str, Any]]):
+        self._pure_offline_batches = list(batches)
         self.log_info(
-            "Pure offline dataloader setup: "
-            f"rank={self._rank} dataset_size={len(self.offline_dataset)} "
-            f"per_rank_batch_size={per_rank_batch_size} num_workers={num_workers}"
-        )
-        print(
-            "[offline-dataloader] "
-            f"rank={self._rank} dataset_size={len(self.offline_dataset)} "
-            f"per_rank_batch_size={per_rank_batch_size} num_workers={num_workers}",
-            file=sys.stderr,
-            flush=True,
+            "Received pure offline training batches: "
+            f"rank={self._rank} num_batches={len(self._pure_offline_batches)}"
         )
 
-    def _pure_offline_dataset_cfg(self):
-        return self.cfg.algorithm.offline_rl.dataset
-
-    def _slice_env_obs_batch(
-        self,
-        env_obs: dict[str, Any],
-        start: int,
-        end: int,
-    ) -> dict[str, Any]:
-        sliced: dict[str, Any] = {}
-        for key, value in env_obs.items():
-            if isinstance(value, torch.Tensor):
-                sliced[key] = value[start:end].clone()
-            elif isinstance(value, list):
-                sliced[key] = list(value[start:end])
-            else:
-                sliced[key] = copy.deepcopy(value)
-        return sliced
-
-    def _transition_obs_to_cpu(
-        self, transition_obs: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        return {
-            key: value.detach().cpu().contiguous()
-            for key, value in transition_obs.items()
-        }
-
-    def _concat_transition_obs_parts(
-        self, obs_parts: list[dict[str, torch.Tensor]]
-    ) -> dict[str, torch.Tensor]:
-        if not obs_parts:
-            return {}
-        return {
-            key: torch.cat([part[key] for part in obs_parts], dim=0).contiguous()
-            for key in obs_parts[0].keys()
-        }
-
-    def _build_pure_offline_transition_kwargs(self) -> dict[str, Any]:
-        dataset_cfg = self._pure_offline_dataset_cfg()
-        sampling_cfg = self.cfg.algorithm.sampling_params
-
-        do_sample = bool(dataset_cfg.get("base_do_sample", sampling_cfg.get("do_sample", True)))
-        temperature = float(
-            dataset_cfg.get("base_temperature", sampling_cfg.get("temperature_train", 1.0))
-        )
-        if temperature <= 0:
-            do_sample = False
-            temperature = 1.0
-
-        kwargs: dict[str, Any] = {"do_sample": do_sample}
-        if SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.OPENVLA,
-            SupportedModel.OPENVLA_OFT,
-        ]:
-            kwargs.update(
-                {
-                    "temperature": temperature,
-                    "top_k": int(dataset_cfg.get("base_top_k", sampling_cfg.get("top_k", -1))),
-                    "top_p": float(dataset_cfg.get("base_top_p", sampling_cfg.get("top_p", 1.0))),
-                    "repetition_penalty": float(
-                        dataset_cfg.get(
-                            "base_repetition_penalty",
-                            sampling_cfg.get("repetition_penalty", 1.0),
-                        )
-                    ),
-                }
+    def _next_received_pure_offline_batch(self) -> dict[str, Any]:
+        if not self._pure_offline_batches:
+            raise RuntimeError(
+                "No preprocessed pure offline batches are available on the actor. "
+                "Runner should populate them via `set_pure_offline_batches` before "
+                "calling `run_training()`."
             )
-        return kwargs
-
-    def _next_pure_offline_batch(self) -> dict[str, Any]:
-        if self.offline_data_iter is None:
-            raise RuntimeError("Pure offline DataLoader is not initialized.")
-        try:
-            batch = next(self.offline_data_iter)
-            self._offline_data_iter_offset += 1
-        except StopIteration:
-            self._offline_data_epoch += 1
-            sampler = getattr(self.offline_data_loader, "sampler", None)
-            if sampler is not None and hasattr(sampler, "set_epoch"):
-                sampler.set_epoch(self._offline_data_epoch)
-            self.offline_data_iter = iter(self.offline_data_loader)
-            batch = next(self.offline_data_iter)
-            self._offline_data_iter_offset = 1
-        return batch
-
-    def _prepare_pure_offline_batch(
-        self,
-        raw_batch: dict[str, Any],
-    ) -> dict[str, Any]:
-        transition_kwargs = self._build_pure_offline_transition_kwargs()
-        preprocess_model = self.model.module if isinstance(self.model, FSDP) else self.model
-        fsdp_full_param_ctx = (
-            FSDP.summon_full_params(self.model, writeback=False, recurse=True)
-            if isinstance(self.model, FSDP)
-            else nullcontext()
-        )
-
-        was_training = self.model.training
-        self.model.eval()
-        with fsdp_full_param_ctx:
-            with torch.no_grad():
-                curr_transition_obs = preprocess_model.build_transition_obs(
-                    env_obs=raw_batch["curr_env_obs"],
-                    **transition_kwargs,
-                )
-                next_transition_obs = preprocess_model.build_transition_obs(
-                    env_obs=raw_batch["next_env_obs"],
-                    **transition_kwargs,
-                )
-        self.model.train(was_training)
-
-        actions = raw_batch["actions"].to(
-            device=self.device,
-            dtype=torch.float32,
-            non_blocking=True,
-        )
-        if hasattr(preprocess_model, "_delta_to_policy_action"):
-            base_flat = curr_transition_obs["base_actions"].flatten(start_dim=1).to(
-                dtype=actions.dtype
-            )
-            delta_actions = actions.view(actions.shape[0], -1) - base_flat
-            actions = preprocess_model._delta_to_policy_action(
-                delta_actions,
-                curr_transition_obs["base_actions"],
-            ).to(dtype=torch.float32)
-
-        batch = {
-            "curr_obs": curr_transition_obs,
-            "next_obs": next_transition_obs,
-            "actions": actions,
-            "rewards": raw_batch["rewards"].to(
-                device=self.device,
-                dtype=torch.float32,
-                non_blocking=True,
-            ),
-            "terminations": raw_batch["terminations"].to(
-                device=self.device,
-                non_blocking=True,
-            ),
-            "truncations": raw_batch["truncations"].to(
-                device=self.device,
-                non_blocking=True,
-            ),
-            "dones": raw_batch["dones"].to(
-                device=self.device,
-                non_blocking=True,
-            ),
-        }
-        if "returns_to_go" in raw_batch:
-            batch["returns_to_go"] = raw_batch["returns_to_go"].to(
-                device=self.device,
-                dtype=torch.float32,
-                non_blocking=True,
-            )
-        return batch
-
-    def _build_pure_offline_trajectory(
-        self,
-        curr_obs: dict[str, torch.Tensor],
-        next_obs: dict[str, torch.Tensor],
-        actions: torch.Tensor,
-        rewards: torch.Tensor,
-        terminations: torch.Tensor,
-        truncations: torch.Tensor,
-        dones: torch.Tensor,
-        max_episode_length: int,
-    ) -> Trajectory:
-        trajectory = Trajectory(
-            max_episode_length=max_episode_length,
-            model_weights_id="offline_dataset",
-            actions=actions.unsqueeze(1).cpu().contiguous(),
-            rewards=rewards.unsqueeze(1).cpu().contiguous(),
-            terminations=terminations.unsqueeze(1).cpu().contiguous(),
-            truncations=truncations.unsqueeze(1).cpu().contiguous(),
-            dones=dones.unsqueeze(1).cpu().contiguous(),
-            curr_obs={
-                key: value.unsqueeze(1).cpu().contiguous()
-                for key, value in curr_obs.items()
-            },
-            next_obs={
-                key: value.unsqueeze(1).cpu().contiguous()
-                for key, value in next_obs.items()
-            },
-        )
-        return trajectory
+        return self._pure_offline_batches.pop(0)
 
     def _preload_pure_offline_replay_buffer(self):
-        print(
-            f"[offline-preload] rank={self._rank} stage=dataset_build:start",
-            file=sys.stderr,
-            flush=True,
-        )
-        dataset = build_libero_chunk_offline_dataset_from_cfg(self.cfg)
-        print(
-            f"[offline-preload] rank={self._rank} stage=dataset_build:done "
-            f"dataset_size={len(dataset)}",
-            file=sys.stderr,
-            flush=True,
-        )
-        dataset_cfg = self._pure_offline_dataset_cfg()
-        preprocess_batch_size = int(dataset_cfg.get("preprocess_batch_size", 32))
-        shard_by_rank = bool(dataset_cfg.get("shard_by_rank", True))
-        transition_kwargs = self._build_pure_offline_transition_kwargs()
-        log_every_episodes = int(dataset_cfg.get("log_every_episodes", 10))
-        log_every_batches = int(dataset_cfg.get("log_every_batches", 25))
-
-        local_episode_count = 0
-        local_transition_count = 0
-        skipped_episode_count = 0
-        local_target_episode_count = (
-            sum(
-                1
-                for episode_offset in range(len(dataset))
-                if (episode_offset % self._world_size == self._rank)
-            )
-            if shard_by_rank
-            else len(dataset)
-        )
-
-        self.log_on_first_rank(
-            f"Prefilling replay buffer from pure offline LIBERO dataset at {dataset.dataset_root}."
-        )
-        self.log_info(
-            "Pure offline preload setup: "
-            f"rank={self._rank} target_episodes={local_target_episode_count} "
-            f"dataset_size={len(dataset)} preprocess_batch_size={preprocess_batch_size} "
-            f"shard_by_rank={shard_by_rank}"
-        )
-        print(
-            "[offline-preload] "
-            f"rank={self._rank} target_episodes={local_target_episode_count} "
-            f"dataset_size={len(dataset)} preprocess_batch_size={preprocess_batch_size} "
-            f"shard_by_rank={shard_by_rank}",
-            file=sys.stderr,
-            flush=True,
-        )
-        self.model.eval()
-        preprocess_model = self.model.module if isinstance(self.model, FSDP) else self.model
-        fsdp_full_param_ctx = (
-            FSDP.summon_full_params(self.model, writeback=False, recurse=True)
-            if isinstance(self.model, FSDP)
-            else nullcontext()
-        )
-        with fsdp_full_param_ctx:
-            for episode_offset in range(len(dataset)):
-                local_store = (
-                    (episode_offset % self._world_size == self._rank)
-                    if shard_by_rank
-                    else True
-                )
-                if not local_store:
-                    continue
-
-                episode_start_time = time.perf_counter()
-                episode = dataset.load_episode(episode_offset)
-                if episode is None:
-                    skipped_episode_count += 1
-                    continue
-
-                curr_obs_parts: list[dict[str, torch.Tensor]] = []
-                next_obs_parts: list[dict[str, torch.Tensor]] = []
-                preprocess_calls = 0
-
-                num_transitions = int(episode.actions.shape[0])
-                for start in range(0, num_transitions, preprocess_batch_size):
-                    end = min(start + preprocess_batch_size, num_transitions)
-                    batch_index = start // preprocess_batch_size + 1
-                    total_batches = (
-                        num_transitions + preprocess_batch_size - 1
-                    ) // preprocess_batch_size
-                    if batch_index == 1 or batch_index % log_every_batches == 0:
-                        self.log_info(
-                            "Pure offline preload batch: "
-                            f"rank={self._rank} episode_offset={episode_offset} "
-                            f"episode_progress={local_episode_count + 1}/{local_target_episode_count} "
-                            f"batch={batch_index}/{total_batches} "
-                            f"transition_range=[{start}, {end})"
-                        )
-                        print(
-                            "[offline-preload-batch] "
-                            f"rank={self._rank} episode_offset={episode_offset} "
-                            f"episode_progress={local_episode_count + 1}/{local_target_episode_count} "
-                            f"batch={batch_index}/{total_batches} "
-                            f"transition_range=[{start}, {end})",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    curr_env_obs = self._slice_env_obs_batch(
-                        episode.curr_env_obs, start, end
-                    )
-                    next_env_obs = self._slice_env_obs_batch(
-                        episode.next_env_obs, start, end
-                    )
-
-                    with torch.no_grad():
-                        curr_transition_obs = preprocess_model.build_transition_obs(
-                            env_obs=curr_env_obs,
-                            **transition_kwargs,
-                        )
-                        next_transition_obs = preprocess_model.build_transition_obs(
-                            env_obs=next_env_obs,
-                            **transition_kwargs,
-                        )
-                    preprocess_calls += 2
-
-                    if local_store:
-                        curr_obs_parts.append(
-                            self._transition_obs_to_cpu(curr_transition_obs)
-                        )
-                        next_obs_parts.append(
-                            self._transition_obs_to_cpu(next_transition_obs)
-                        )
-
-                trajectory = self._build_pure_offline_trajectory(
-                    curr_obs=self._concat_transition_obs_parts(curr_obs_parts),
-                    next_obs=self._concat_transition_obs_parts(next_obs_parts),
-                    actions=episode.actions,
-                    rewards=episode.rewards,
-                    terminations=episode.terminations,
-                    truncations=episode.truncations,
-                    dones=episode.dones,
-                    max_episode_length=episode.max_episode_length,
-                )
-                self.replay_buffer.add_trajectories([trajectory])
-                local_episode_count += 1
-                local_transition_count += episode.max_episode_length
-                episode_elapsed = time.perf_counter() - episode_start_time
-
-                if (
-                    local_episode_count == 1
-                    or local_episode_count % log_every_episodes == 0
-                ):
-                    self.log_info(
-                        f"Pure offline preload: rank={self._rank} "
-                        f"episodes={local_episode_count}/{local_target_episode_count} "
-                        f"transitions={local_transition_count} "
-                        f"last_episode_offset={episode_offset} "
-                        f"last_episode_len={episode.max_episode_length} "
-                        f"preprocess_calls={preprocess_calls} "
-                        f"episode_time_s={episode_elapsed:.2f}"
-                    )
-                    print(
-                        "[offline-preload-episode] "
-                        f"rank={self._rank} "
-                        f"episodes={local_episode_count}/{local_target_episode_count} "
-                        f"transitions={local_transition_count} "
-                        f"last_episode_offset={episode_offset} "
-                        f"last_episode_len={episode.max_episode_length} "
-                        f"preprocess_calls={preprocess_calls} "
-                        f"episode_time_s={episode_elapsed:.2f}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-
-        self.log_info(
-            f"Pure offline preload finished on rank={self._rank}: "
-            f"episodes={local_episode_count} transitions={local_transition_count} "
-            f"skipped={skipped_episode_count}"
+        raise RuntimeError(
+            "Pure offline replay-buffer preload has been removed. "
+            "Use rollout-side preprocessing via `prepare_pure_offline_train_batches`."
         )
 
     def _build_sac_forward_kwargs(self) -> dict:
@@ -1386,9 +978,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         with self.worker_timer("sample"):
             if self.use_pure_offline_dataset:
-                global_batch = self._prepare_pure_offline_batch(
-                    self._next_pure_offline_batch()
-                )
+                global_batch = self._next_received_pure_offline_batch()
             else:
                 global_batch = next(self.buffer_dataloader_iter)
 
@@ -1536,14 +1126,6 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         return metrics_data
 
     def process_train_metrics(self, metrics):
-        if self.use_pure_offline_dataset:
-            append_to_dict(
-                metrics,
-                {
-                    "offline_data/epoch": self._offline_data_epoch,
-                    "offline_data/iter_offset": self._offline_data_iter_offset,
-                },
-            )
         if self.replay_buffer is not None:
             replay_buffer_stats = self.replay_buffer.get_stats()
             replay_buffer_stats = {
@@ -1591,6 +1173,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         if self.use_pure_offline_dataset:
             train_actor = True
+            required_batches = int(self.cfg.algorithm.get("update_epoch", 1))
+            if len(self._pure_offline_batches) < required_batches:
+                raise RuntimeError(
+                    "Pure offline training requires preprocessed batches from the "
+                    "rollout/preprocess worker before each actor update. "
+                    f"Expected at least {required_batches}, got "
+                    f"{len(self._pure_offline_batches)}."
+                )
         else:
             min_buffer_size = self.cfg.algorithm.replay_buffer.get(
                 "min_buffer_size", 100
@@ -1700,17 +1290,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             )
             self.replay_buffer.save_checkpoint(buffer_save_path)
         if self.use_pure_offline_dataset:
-            offline_state_path = os.path.join(
-                save_base_path, f"sac_components/offline_data/rank_{self._rank}.pt"
-            )
-            os.makedirs(os.path.dirname(offline_state_path), exist_ok=True)
-            torch.save(
-                {
-                    "data_epoch": int(self._offline_data_epoch),
-                    "data_iter_offset": int(self._offline_data_iter_offset),
-                },
-                offline_state_path,
-            )
+            self._pure_offline_batches = []
 
     def load_checkpoint(self, load_base_path):
         # load model
@@ -1764,25 +1344,4 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             )
             self.replay_buffer.load_checkpoint(buffer_load_path)
         if self.use_pure_offline_dataset:
-            offline_state_path = os.path.join(
-                load_base_path, f"sac_components/offline_data/rank_{self._rank}.pt"
-            )
-            if os.path.exists(offline_state_path):
-                state_payload = torch.load(offline_state_path, map_location="cpu")
-                self._offline_data_epoch = int(state_payload.get("data_epoch", 0))
-                self._offline_data_iter_offset = int(
-                    state_payload.get("data_iter_offset", 0)
-                )
-                if self.offline_data_loader is not None:
-                    sampler = getattr(self.offline_data_loader, "sampler", None)
-                    if sampler is not None and hasattr(sampler, "set_epoch"):
-                        sampler.set_epoch(self._offline_data_epoch)
-                    self.offline_data_iter = iter(self.offline_data_loader)
-                    for _ in range(self._offline_data_iter_offset):
-                        try:
-                            next(self.offline_data_iter)
-                        except StopIteration:
-                            self._offline_data_epoch += 1
-                            if sampler is not None and hasattr(sampler, "set_epoch"):
-                                sampler.set_epoch(self._offline_data_epoch)
-                            self.offline_data_iter = iter(self.offline_data_loader)
+            self._pure_offline_batches = []

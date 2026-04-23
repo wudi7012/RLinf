@@ -4,7 +4,7 @@ defaults:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 2,5
+    actor,env,rollout: 0,5
 
 runner:
   logger:
@@ -27,7 +27,7 @@ algorithm:
       max_episodes: 8
 
 actor:
-  micro_batch_size: 1
+  micro_batch_size: 2
   global_batch_size: 4
   enable_offload: true
 
@@ -45,6 +45,6 @@ rollout:
 
 env:
   train:
-    total_num_envs: 1
+    total_num_envs: 2
   eval:
     total_num_envs: 2

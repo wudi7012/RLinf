@@ -25,6 +25,7 @@ from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.q_head import MultiQHead
 from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.models.vla_adapter.base_feature_extractor import (
+    VLAAdapterFeatures,
     attach_base_actions,
     extract_features_from_env_obs,
     extract_features_from_forward_inputs,
@@ -289,6 +290,17 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
             if key not in {"delta_pre_tanh", "action"}
         }
 
+    def _build_transition_obs_from_extracted(
+        self,
+        extracted: VLAAdapterFeatures,
+    ) -> dict[str, torch.Tensor]:
+        return {
+            **extracted.forward_inputs,
+            "features": extracted.features.to(dtype=torch.float32),
+            "states": extracted.states.to(dtype=torch.float32),
+            "base_actions": extracted.base_actions.to(dtype=torch.float32),
+        }
+
     @torch.no_grad()
     def build_transition_obs(
         self,
@@ -308,21 +320,14 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
             calculate_values=False,
             **kwargs,
         )
-        states = env_obs["states"]
-        if not isinstance(states, torch.Tensor):
-            states = torch.as_tensor(states)
-        device = next(self.base_vla.parameters()).device
-        states = states.to(device=device, dtype=torch.float32)
-        base_actions = torch.as_tensor(
+        extracted = attach_base_actions(
+            extract_features_from_env_obs(self.base_vla, env_obs),
             base_chunk_actions,
-            device=device,
-            dtype=torch.float32,
         )
-        transition_obs = {
-            **base_result["forward_inputs"],
-            "states": states,
-            "base_actions": base_actions,
-        }
+        transition_obs = self._build_transition_obs_from_extracted(extracted)
+        for key, value in base_result["forward_inputs"].items():
+            if key not in transition_obs:
+                transition_obs[key] = value
         return transition_obs
 
     def _extract_adapter_context(
@@ -330,6 +335,17 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
         obs: dict[str, torch.Tensor],
         **kwargs,
     ):
+        if "features" in obs:
+            device = next(self.base_vla.parameters()).device
+            return VLAAdapterFeatures(
+                features=obs["features"].to(device=device, dtype=torch.float32),
+                base_actions=obs["base_actions"].to(
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                states=obs["states"].to(device=device, dtype=torch.float32),
+                forward_inputs=self._get_transition_obs_from_forward_inputs(obs),
+            )
         if "input_ids" in obs:
             return extract_features_from_forward_inputs(self.base_vla, obs)
         base_chunk_actions, _ = self.base_vla.predict_action_batch(
@@ -464,6 +480,7 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
 
         forward_inputs = {
             **base_result["forward_inputs"],
+            "features": extracted.features.to(dtype=torch.float32),
             "states": extracted.states.to(dtype=torch.float32),
             "base_actions": base_actions,
             "delta_pre_tanh": delta_pre_tanh.view_as(base_actions).to(dtype=torch.float32),

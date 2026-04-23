@@ -19,9 +19,16 @@ from typing import Any, Literal
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+from rlinf.algorithms.offline_rl import is_pure_offline_dataset_enabled
 from rlinf.config import SupportedModel
+from rlinf.data.datasets.libero_offline_rl import (
+    build_libero_chunk_transition_dataset_from_cfg,
+    libero_offline_transition_collate_fn,
+)
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
@@ -90,6 +97,12 @@ class MultiStepRolloutWorker(Worker):
         self.collect_versions = self.cfg.algorithm.loss_type == "decoupled_actor_critic"
         self.version = 0
         self.finished_episodes = None
+        self.use_pure_offline_dataset = is_pure_offline_dataset_enabled(cfg)
+        self.offline_dataset = None
+        self.offline_data_loader = None
+        self.offline_data_iter = None
+        self._offline_data_epoch = 0
+        self._offline_data_iter_offset = 0
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -116,16 +129,16 @@ class MultiStepRolloutWorker(Worker):
                 eval_batch_size=self.eval_batch_size,
             )
 
-        self.dst_ranks = {
-            "train": self._setup_dst_ranks(
+        self.dst_ranks = {}
+        self.src_ranks = {}
+        use_train_env_comm = not self.use_pure_offline_dataset
+        if use_train_env_comm:
+            self.dst_ranks["train"] = self._setup_dst_ranks(
                 self.total_num_train_envs // self.num_pipeline_stages
-            ),
-        }
-        self.src_ranks = {
-            "train": self._setup_src_ranks(
+            )
+            self.src_ranks["train"] = self._setup_src_ranks(
                 self.total_num_train_envs // self.num_pipeline_stages
-            ),
-        }
+            )
         if self.enable_eval:
             self.dst_ranks["eval"] = self._setup_dst_ranks(
                 self.total_num_eval_envs // self.num_pipeline_stages
@@ -137,6 +150,8 @@ class MultiStepRolloutWorker(Worker):
         self.log_info(f"Rollout worker initialized with dst_ranks: {self.dst_ranks}")
         self.log_info(f"Rollout worker initialized with src_ranks: {self.src_ranks}")
         self.setup_sample_params()
+        if self.use_pure_offline_dataset:
+            self.build_pure_offline_dataloader()
         if self.enable_offload:
             self.offload_model()
 
@@ -321,6 +336,202 @@ class MultiStepRolloutWorker(Worker):
         env_obs = dict(env_obs)
         env_obs.pop("task_descriptions", None)
         return env_obs
+
+    def _pure_offline_dataset_cfg(self):
+        return self.cfg.algorithm.offline_rl.dataset
+
+    def build_pure_offline_dataloader(self) -> None:
+        dataset_cfg = self._pure_offline_dataset_cfg()
+        per_rank_batch_size = self.cfg.actor.global_batch_size // self._world_size
+        if per_rank_batch_size < 1:
+            raise ValueError(
+                f"Per-rank offline batch size must be >= 1, got {per_rank_batch_size}."
+            )
+
+        self.offline_dataset = build_libero_chunk_transition_dataset_from_cfg(self.cfg)
+        if len(self.offline_dataset) < per_rank_batch_size:
+            raise ValueError(
+                f"Offline dataset size ({len(self.offline_dataset)}) must be >= "
+                f"per-rank batch size ({per_rank_batch_size})."
+            )
+
+        sampler = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            sampler = DistributedSampler(
+                self.offline_dataset,
+                num_replicas=self._world_size,
+                rank=self._rank,
+                shuffle=bool(dataset_cfg.get("shuffle", True)),
+                seed=int(dataset_cfg.get("seed", self.cfg.actor.get("seed", 1234))),
+                drop_last=True,
+            )
+
+        num_workers = int(dataset_cfg.get("num_workers", 0))
+        pin_memory = bool(dataset_cfg.get("pin_memory", True))
+        persistent_workers = num_workers > 0 and bool(
+            dataset_cfg.get("persistent_workers", True)
+        )
+
+        self.offline_data_loader = DataLoader(
+            self.offline_dataset,
+            batch_size=per_rank_batch_size,
+            sampler=sampler,
+            shuffle=(sampler is None),
+            num_workers=num_workers,
+            drop_last=True,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            collate_fn=libero_offline_transition_collate_fn,
+        )
+        self._offline_data_epoch = 0
+        self._offline_data_iter_offset = 0
+        if sampler is not None:
+            sampler.set_epoch(self._offline_data_epoch)
+        self.offline_data_iter = iter(self.offline_data_loader)
+        self.log_info(
+            "Pure offline preprocess dataloader setup: "
+            f"rank={self._rank} dataset_size={len(self.offline_dataset)} "
+            f"per_rank_batch_size={per_rank_batch_size} num_workers={num_workers}"
+        )
+
+    def _build_pure_offline_transition_kwargs(self) -> dict[str, Any]:
+        dataset_cfg = self._pure_offline_dataset_cfg()
+        sampling_cfg = self.cfg.algorithm.sampling_params
+
+        do_sample = bool(
+            dataset_cfg.get("base_do_sample", sampling_cfg.get("do_sample", True))
+        )
+        temperature = float(
+            dataset_cfg.get(
+                "base_temperature", sampling_cfg.get("temperature_train", 1.0)
+            )
+        )
+        if temperature <= 0:
+            do_sample = False
+            temperature = 1.0
+
+        kwargs: dict[str, Any] = {"do_sample": do_sample}
+        if SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.OPENVLA,
+            SupportedModel.OPENVLA_OFT,
+        ]:
+            kwargs.update(
+                {
+                    "temperature": temperature,
+                    "top_k": int(
+                        dataset_cfg.get("base_top_k", sampling_cfg.get("top_k", -1))
+                    ),
+                    "top_p": float(
+                        dataset_cfg.get("base_top_p", sampling_cfg.get("top_p", 1.0))
+                    ),
+                    "repetition_penalty": float(
+                        dataset_cfg.get(
+                            "base_repetition_penalty",
+                            sampling_cfg.get("repetition_penalty", 1.0),
+                        )
+                    ),
+                }
+            )
+        return kwargs
+
+    def _next_pure_offline_raw_batch(self) -> dict[str, Any]:
+        if self.offline_data_iter is None:
+            raise RuntimeError("Pure offline preprocess DataLoader is not initialized.")
+        try:
+            batch = next(self.offline_data_iter)
+            self._offline_data_iter_offset += 1
+        except StopIteration:
+            self._offline_data_epoch += 1
+            sampler = getattr(self.offline_data_loader, "sampler", None)
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(self._offline_data_epoch)
+            self.offline_data_iter = iter(self.offline_data_loader)
+            batch = next(self.offline_data_iter)
+            self._offline_data_iter_offset = 1
+        return batch
+
+    def _transition_obs_to_cpu(
+        self,
+        transition_obs: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        return {
+            key: value.detach().cpu().contiguous()
+            for key, value in transition_obs.items()
+        }
+
+    def _prepare_pure_offline_batch(
+        self,
+        raw_batch: dict[str, Any],
+    ) -> dict[str, Any]:
+        transition_kwargs = self._build_pure_offline_transition_kwargs()
+        with torch.no_grad():
+            curr_transition_obs = self.hf_model.build_transition_obs(
+                env_obs=raw_batch["curr_env_obs"],
+                **transition_kwargs,
+            )
+            next_transition_obs = self.hf_model.build_transition_obs(
+                env_obs=raw_batch["next_env_obs"],
+                **transition_kwargs,
+            )
+
+        actions = raw_batch["actions"].to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        if hasattr(self.hf_model, "_delta_to_policy_action"):
+            base_flat = curr_transition_obs["base_actions"].flatten(start_dim=1).to(
+                dtype=actions.dtype
+            )
+            delta_actions = actions.view(actions.shape[0], -1) - base_flat
+            actions = self.hf_model._delta_to_policy_action(
+                delta_actions,
+                curr_transition_obs["base_actions"],
+            ).to(dtype=torch.float32)
+
+        batch = {
+            "curr_obs": self._transition_obs_to_cpu(curr_transition_obs),
+            "next_obs": self._transition_obs_to_cpu(next_transition_obs),
+            "actions": actions.detach().cpu().contiguous(),
+            "rewards": raw_batch["rewards"].to(dtype=torch.float32).cpu().contiguous(),
+            "terminations": raw_batch["terminations"].cpu().contiguous(),
+            "truncations": raw_batch["truncations"].cpu().contiguous(),
+            "dones": raw_batch["dones"].cpu().contiguous(),
+        }
+        if "returns_to_go" in raw_batch:
+            batch["returns_to_go"] = (
+                raw_batch["returns_to_go"]
+                .to(dtype=torch.float32)
+                .cpu()
+                .contiguous()
+            )
+        return batch
+
+    def prepare_pure_offline_train_batches(self, num_batches: int) -> list[dict[str, Any]]:
+        if not self.use_pure_offline_dataset:
+            raise RuntimeError(
+                "prepare_pure_offline_train_batches is only available when "
+                "algorithm.offline_rl.dataset.enable=true."
+            )
+        if self.enable_offload:
+            self.reload_model()
+
+        self.hf_model.eval()
+        prepared_batches: list[dict[str, Any]] = []
+        for batch_idx in range(int(num_batches)):
+            prepared_batches.append(
+                self._prepare_pure_offline_batch(self._next_pure_offline_raw_batch())
+            )
+            self.log_info(
+                "Prepared pure offline training batch: "
+                f"rank={self._rank} batch={batch_idx + 1}/{num_batches} "
+                f"data_epoch={self._offline_data_epoch} "
+                f"iter_offset={self._offline_data_iter_offset}"
+            )
+
+        if self.enable_offload:
+            self.offload_model()
+        return prepared_batches
 
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""

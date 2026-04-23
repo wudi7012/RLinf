@@ -17,6 +17,7 @@ import json
 import hydra
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.algorithms.offline_rl import is_pure_offline_dataset_enabled
 from rlinf.config import validate_cfg
 from rlinf.runners.offline_runner import OfflineRunner
 from rlinf.scheduler import Cluster
@@ -54,6 +55,7 @@ def main(cfg) -> None:
     )
 
     enable_eval = cfg.runner.val_check_interval > 0 or cfg.runner.only_eval
+    enable_pure_offline_preprocess = is_pure_offline_dataset_enabled(cfg)
     env_group = None
     rollout_group = None
     if enable_eval:
@@ -64,6 +66,7 @@ def main(cfg) -> None:
             placement_strategy=env_placement,
         )
 
+    if enable_eval or enable_pure_offline_preprocess:
         rollout_placement = component_placement.get_strategy("rollout")
         rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
             cluster,
