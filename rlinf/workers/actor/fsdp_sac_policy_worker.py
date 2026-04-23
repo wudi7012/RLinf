@@ -14,6 +14,9 @@
 
 import copy
 import os
+import sys
+import time
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import numpy as np
@@ -39,6 +42,7 @@ from rlinf.data.embodied_buffer_dataset import (
 )
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+from rlinf.hybrid_engines.fsdp import FSDP
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
 from rlinf.scheduler import Channel, Worker
@@ -71,11 +75,37 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
         self.offline_rl_name = get_offline_rl_algo_name(cfg)
         self.use_pure_offline_dataset = is_pure_offline_dataset_enabled(cfg)
+        self.use_shared_target_model = False
 
     def init_worker(self):
+        print(
+            f"[offline-init] rank={self._rank} stage=setup_model_and_optimizer:start",
+            file=sys.stderr,
+            flush=True,
+        )
         self.setup_model_and_optimizer(initialize_target=True)
+        print(
+            f"[offline-init] rank={self._rank} stage=setup_model_and_optimizer:done",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(
+            f"[offline-init] rank={self._rank} stage=setup_sac_components:start",
+            file=sys.stderr,
+            flush=True,
+        )
         self.setup_sac_components()
+        print(
+            f"[offline-init] rank={self._rank} stage=setup_sac_components:done",
+            file=sys.stderr,
+            flush=True,
+        )
         self.soft_update_target_model(tau=1.0)
+        print(
+            f"[offline-init] rank={self._rank} stage=soft_update_target_model:done",
+            file=sys.stderr,
+            flush=True,
+        )
         if self.use_dsrl:
             self._init_target_shadow()
         if self.cfg.actor.get("enable_offload", False):
@@ -91,9 +121,25 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
     def setup_model_and_optimizer(self, initialize_target=False) -> None:
         """Setup model, lr_scheduler, optimizer and grad_scaler."""
         """Add initializing target model logic."""
+        use_shared_target_model = bool(
+            initialize_target
+            and self.cfg.algorithm.offline_rl.get("share_target_model", False)
+        )
+        print(
+            f"[offline-init] rank={self._rank} stage=model_provider:start",
+            file=sys.stderr,
+            flush=True,
+        )
         module = self.model_provider_func()
-        if initialize_target:
+        if initialize_target and not use_shared_target_model:
             target_module = self.model_provider_func()
+        print(
+            f"[offline-init] rank={self._rank} stage=model_provider:done "
+            f"initialize_target={initialize_target} "
+            f"use_shared_target_model={use_shared_target_model}",
+            file=sys.stderr,
+            flush=True,
+        )
 
         # Enable gradient checkpointing if configured
         if self.cfg.actor.model.get("gradient_checkpointing", False):
@@ -108,15 +154,34 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.model = self._strategy.wrap_model(
             model=module, device_mesh=self._device_mesh
         )
+        print(
+            f"[offline-init] rank={self._rank} stage=wrap_model:done",
+            file=sys.stderr,
+            flush=True,
+        )
         # When precision is null (e.g. Pi0), detect actual dtype from wrapped model
         if self.torch_dtype is None:
             self.torch_dtype = next(self.model.parameters()).dtype
-        if initialize_target:
+        if initialize_target and not use_shared_target_model:
             self.target_model = self._strategy.wrap_model(
                 model=target_module, device_mesh=self._device_mesh
             )
             self.target_model.requires_grad_(False)
             self.target_model_initialized = True
+            print(
+                f"[offline-init] rank={self._rank} stage=wrap_target_model:done",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif initialize_target and use_shared_target_model:
+            self.target_model = self.model
+            self.target_model_initialized = True
+            self.use_shared_target_model = True
+            print(
+                f"[offline-init] rank={self._rank} stage=share_target_model:done",
+                file=sys.stderr,
+                flush=True,
+            )
 
         self.use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
         use_dsrl = self.use_dsrl
@@ -138,6 +203,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         self.optimizer = optimizers[0]
         self.qf_optimizer = optimizers[1]
+        print(
+            f"[offline-init] rank={self._rank} stage=build_optimizers:done",
+            file=sys.stderr,
+            flush=True,
+        )
 
         if self.offline_rl_name != "iql":
             alpha_type = self.cfg.algorithm.entropy_tuning.get(
@@ -183,9 +253,19 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 )
 
         self.build_lr_schedulers()
+        print(
+            f"[offline-init] rank={self._rank} stage=build_lr_schedulers:done",
+            file=sys.stderr,
+            flush=True,
+        )
 
         self.grad_scaler = self.build_grad_scaler(
             self.cfg.actor.fsdp_config.amp.use_grad_scaler
+        )
+        print(
+            f"[offline-init] rank={self._rank} stage=build_grad_scaler:done",
+            file=sys.stderr,
+            flush=True,
         )
 
     def build_lr_schedulers(self):
@@ -402,72 +482,172 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         return trajectory
 
     def _preload_pure_offline_replay_buffer(self):
+        print(
+            f"[offline-preload] rank={self._rank} stage=dataset_build:start",
+            file=sys.stderr,
+            flush=True,
+        )
         dataset = build_libero_chunk_offline_dataset_from_cfg(self.cfg)
+        print(
+            f"[offline-preload] rank={self._rank} stage=dataset_build:done "
+            f"dataset_size={len(dataset)}",
+            file=sys.stderr,
+            flush=True,
+        )
         dataset_cfg = self._pure_offline_dataset_cfg()
         preprocess_batch_size = int(dataset_cfg.get("preprocess_batch_size", 32))
         shard_by_rank = bool(dataset_cfg.get("shard_by_rank", True))
         transition_kwargs = self._build_pure_offline_transition_kwargs()
+        log_every_episodes = int(dataset_cfg.get("log_every_episodes", 10))
+        log_every_batches = int(dataset_cfg.get("log_every_batches", 25))
 
         local_episode_count = 0
         local_transition_count = 0
         skipped_episode_count = 0
+        local_target_episode_count = (
+            sum(
+                1
+                for episode_offset in range(len(dataset))
+                if (episode_offset % self._world_size == self._rank)
+            )
+            if shard_by_rank
+            else len(dataset)
+        )
 
         self.log_on_first_rank(
             f"Prefilling replay buffer from pure offline LIBERO dataset at {dataset.dataset_root}."
         )
+        self.log_info(
+            "Pure offline preload setup: "
+            f"rank={self._rank} target_episodes={local_target_episode_count} "
+            f"dataset_size={len(dataset)} preprocess_batch_size={preprocess_batch_size} "
+            f"shard_by_rank={shard_by_rank}"
+        )
+        print(
+            "[offline-preload] "
+            f"rank={self._rank} target_episodes={local_target_episode_count} "
+            f"dataset_size={len(dataset)} preprocess_batch_size={preprocess_batch_size} "
+            f"shard_by_rank={shard_by_rank}",
+            file=sys.stderr,
+            flush=True,
+        )
         self.model.eval()
-        for episode_offset in range(len(dataset)):
-            episode = dataset.load_episode(episode_offset)
-            if episode is None:
-                skipped_episode_count += 1
-                continue
-
-            local_store = (episode_offset % self._world_size == self._rank) if shard_by_rank else True
-            curr_obs_parts: list[dict[str, torch.Tensor]] = []
-            next_obs_parts: list[dict[str, torch.Tensor]] = []
-
-            num_transitions = int(episode.actions.shape[0])
-            for start in range(0, num_transitions, preprocess_batch_size):
-                end = min(start + preprocess_batch_size, num_transitions)
-                curr_env_obs = self._slice_env_obs_batch(episode.curr_env_obs, start, end)
-                next_env_obs = self._slice_env_obs_batch(episode.next_env_obs, start, end)
-
-                with torch.no_grad():
-                    curr_transition_obs = self.model.build_transition_obs(
-                        env_obs=curr_env_obs,
-                        **transition_kwargs,
-                    )
-                    next_transition_obs = self.model.build_transition_obs(
-                        env_obs=next_env_obs,
-                        **transition_kwargs,
-                    )
-
-                if local_store:
-                    curr_obs_parts.append(self._transition_obs_to_cpu(curr_transition_obs))
-                    next_obs_parts.append(self._transition_obs_to_cpu(next_transition_obs))
-
-            if not local_store:
-                continue
-
-            trajectory = self._build_pure_offline_trajectory(
-                curr_obs=self._concat_transition_obs_parts(curr_obs_parts),
-                next_obs=self._concat_transition_obs_parts(next_obs_parts),
-                actions=episode.actions,
-                rewards=episode.rewards,
-                terminations=episode.terminations,
-                truncations=episode.truncations,
-                dones=episode.dones,
-                max_episode_length=episode.max_episode_length,
-            )
-            self.replay_buffer.add_trajectories([trajectory])
-            local_episode_count += 1
-            local_transition_count += episode.max_episode_length
-
-            if local_episode_count == 1 or local_episode_count % 100 == 0:
-                self.log_info(
-                    f"Pure offline preload: rank={self._rank} "
-                    f"episodes={local_episode_count} transitions={local_transition_count}"
+        preprocess_model = self.model.module if isinstance(self.model, FSDP) else self.model
+        fsdp_full_param_ctx = (
+            FSDP.summon_full_params(self.model, writeback=False, recurse=True)
+            if isinstance(self.model, FSDP)
+            else nullcontext()
+        )
+        with fsdp_full_param_ctx:
+            for episode_offset in range(len(dataset)):
+                local_store = (
+                    (episode_offset % self._world_size == self._rank)
+                    if shard_by_rank
+                    else True
                 )
+                if not local_store:
+                    continue
+
+                episode_start_time = time.perf_counter()
+                episode = dataset.load_episode(episode_offset)
+                if episode is None:
+                    skipped_episode_count += 1
+                    continue
+
+                curr_obs_parts: list[dict[str, torch.Tensor]] = []
+                next_obs_parts: list[dict[str, torch.Tensor]] = []
+                preprocess_calls = 0
+
+                num_transitions = int(episode.actions.shape[0])
+                for start in range(0, num_transitions, preprocess_batch_size):
+                    end = min(start + preprocess_batch_size, num_transitions)
+                    batch_index = start // preprocess_batch_size + 1
+                    total_batches = (
+                        num_transitions + preprocess_batch_size - 1
+                    ) // preprocess_batch_size
+                    if batch_index == 1 or batch_index % log_every_batches == 0:
+                        self.log_info(
+                            "Pure offline preload batch: "
+                            f"rank={self._rank} episode_offset={episode_offset} "
+                            f"episode_progress={local_episode_count + 1}/{local_target_episode_count} "
+                            f"batch={batch_index}/{total_batches} "
+                            f"transition_range=[{start}, {end})"
+                        )
+                        print(
+                            "[offline-preload-batch] "
+                            f"rank={self._rank} episode_offset={episode_offset} "
+                            f"episode_progress={local_episode_count + 1}/{local_target_episode_count} "
+                            f"batch={batch_index}/{total_batches} "
+                            f"transition_range=[{start}, {end})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    curr_env_obs = self._slice_env_obs_batch(
+                        episode.curr_env_obs, start, end
+                    )
+                    next_env_obs = self._slice_env_obs_batch(
+                        episode.next_env_obs, start, end
+                    )
+
+                    with torch.no_grad():
+                        curr_transition_obs = preprocess_model.build_transition_obs(
+                            env_obs=curr_env_obs,
+                            **transition_kwargs,
+                        )
+                        next_transition_obs = preprocess_model.build_transition_obs(
+                            env_obs=next_env_obs,
+                            **transition_kwargs,
+                        )
+                    preprocess_calls += 2
+
+                    if local_store:
+                        curr_obs_parts.append(
+                            self._transition_obs_to_cpu(curr_transition_obs)
+                        )
+                        next_obs_parts.append(
+                            self._transition_obs_to_cpu(next_transition_obs)
+                        )
+
+                trajectory = self._build_pure_offline_trajectory(
+                    curr_obs=self._concat_transition_obs_parts(curr_obs_parts),
+                    next_obs=self._concat_transition_obs_parts(next_obs_parts),
+                    actions=episode.actions,
+                    rewards=episode.rewards,
+                    terminations=episode.terminations,
+                    truncations=episode.truncations,
+                    dones=episode.dones,
+                    max_episode_length=episode.max_episode_length,
+                )
+                self.replay_buffer.add_trajectories([trajectory])
+                local_episode_count += 1
+                local_transition_count += episode.max_episode_length
+                episode_elapsed = time.perf_counter() - episode_start_time
+
+                if (
+                    local_episode_count == 1
+                    or local_episode_count % log_every_episodes == 0
+                ):
+                    self.log_info(
+                        f"Pure offline preload: rank={self._rank} "
+                        f"episodes={local_episode_count}/{local_target_episode_count} "
+                        f"transitions={local_transition_count} "
+                        f"last_episode_offset={episode_offset} "
+                        f"last_episode_len={episode.max_episode_length} "
+                        f"preprocess_calls={preprocess_calls} "
+                        f"episode_time_s={episode_elapsed:.2f}"
+                    )
+                    print(
+                        "[offline-preload-episode] "
+                        f"rank={self._rank} "
+                        f"episodes={local_episode_count}/{local_target_episode_count} "
+                        f"transitions={local_transition_count} "
+                        f"last_episode_offset={episode_offset} "
+                        f"last_episode_len={episode.max_episode_length} "
+                        f"preprocess_calls={preprocess_calls} "
+                        f"episode_time_s={episode_elapsed:.2f}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
         self.log_info(
             f"Pure offline preload finished on rank={self._rank}: "
@@ -562,6 +742,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         keeps the accumulated EMA state in float32 (ULP ~3.6e-8) across
         steps, preventing precision loss.
         """
+        if self.use_shared_target_model:
+            return
         self._target_shadow_f32 = {}
         for name, param in self.target_model.named_parameters():
             self._target_shadow_f32[name] = param.data.float().clone()
@@ -577,6 +759,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             tau = self.cfg.algorithm.tau
 
         assert self.target_model_initialized
+        if self.use_shared_target_model:
+            return
 
         with torch.no_grad():
             if not hasattr(self, "_target_shadow_f32"):
@@ -1307,18 +1491,18 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 save_full_model_weights=False,
             )
 
-        # save target model
-        target_model_save_path = os.path.join(
-            save_base_path, "sac_components/target_model"
-        )
-        os.makedirs(target_model_save_path, exist_ok=True)
-        target_model_state_dict = self._strategy.get_model_state_dict(
-            self.target_model, cpu_offload=False, full_state_dict=True
-        )
-        torch.save(
-            target_model_state_dict,
-            os.path.join(target_model_save_path, f"checkpoint_rank_{self._rank}.pt"),
-        )
+        if not self.use_shared_target_model:
+            target_model_save_path = os.path.join(
+                save_base_path, "sac_components/target_model"
+            )
+            os.makedirs(target_model_save_path, exist_ok=True)
+            target_model_state_dict = self._strategy.get_model_state_dict(
+                self.target_model, cpu_offload=False, full_state_dict=True
+            )
+            torch.save(
+                target_model_state_dict,
+                os.path.join(target_model_save_path, f"checkpoint_rank_{self._rank}.pt"),
+            )
 
         # save replay buffer
         buffer_save_path = os.path.join(
@@ -1358,19 +1542,19 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 load_path=cql_alpha_load_path,
             )
 
-        # load target model
-        target_model_load_path = os.path.join(
-            load_base_path, "sac_components/target_model"
-        )
-        target_model_state_dict = torch.load(
-            os.path.join(target_model_load_path, f"checkpoint_rank_{self._rank}.pt")
-        )
-        self._strategy.load_model_with_state_dict(
-            self.target_model,
-            target_model_state_dict,
-            cpu_offload=False,
-            full_state_dict=True,
-        )
+        if not self.use_shared_target_model:
+            target_model_load_path = os.path.join(
+                load_base_path, "sac_components/target_model"
+            )
+            target_model_state_dict = torch.load(
+                os.path.join(target_model_load_path, f"checkpoint_rank_{self._rank}.pt")
+            )
+            self._strategy.load_model_with_state_dict(
+                self.target_model,
+                target_model_state_dict,
+                cpu_offload=False,
+                full_state_dict=True,
+            )
 
         # load replay buffer
         buffer_load_path = os.path.join(

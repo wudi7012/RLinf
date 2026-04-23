@@ -4,7 +4,7 @@ defaults:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 2,3
+    actor,env,rollout: 2,5
 
 runner:
   logger:
@@ -26,6 +26,9 @@ algorithm:
     dataset:
       preprocess_batch_size: 4
       shard_by_rank: true
+      max_episodes: 8
+      log_every_episodes: 1
+      log_every_batches: 5
 
 actor:
   micro_batch_size: 1

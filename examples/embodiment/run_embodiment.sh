@@ -2,7 +2,6 @@
 
 export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
-export SRC_FILE="${EMBODIED_PATH}/train_embodied_agent.py"
 
 export MUJOCO_GL="osmesa"
 export PYOPENGL_PLATFORM="osmesa"
@@ -28,12 +27,18 @@ else
     CONFIG_NAME=$1
 fi
 
+if [[ "${CONFIG_NAME}" =~ ^libero_(cql|calql|iql)_openvlaoft_adapter_offline(_2gpu_min)?$ ]]; then
+    export SRC_FILE="${EMBODIED_PATH}/train_offline_rl.py"
+else
+    export SRC_FILE="${EMBODIED_PATH}/train_embodied_agent.py"
+fi
+
 # NOTE: Set the active robot platform (required for correct action dimension and normalization), supported platforms are LIBERO, ALOHA, BRIDGE, default is LIBERO
 ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
 
 export ROBOT_PLATFORM
 # NCCL Debug
-# export NCCL_P2P_DISABLE=1  # 禁用P2P通信
+export NCCL_P2P_DISABLE=1  # 禁用P2P通信
 
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
 

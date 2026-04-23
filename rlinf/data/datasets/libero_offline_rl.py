@@ -77,6 +77,7 @@ class LiberoChunkOfflineDataset:
         intermediate_reward: float = 0.0,
         camera_name: str = "image",
         state_key: str = "state",
+        max_episodes: Optional[int] = None,
     ) -> None:
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         self.data_root = self._resolve_data_root(self.dataset_root)
@@ -89,6 +90,8 @@ class LiberoChunkOfflineDataset:
         self.state_key = state_key
 
         self._episode_files = sorted(self.data_root.glob("**/*.parquet"))
+        if max_episodes is not None:
+            self._episode_files = self._episode_files[: int(max_episodes)]
         if not self._episode_files:
             raise FileNotFoundError(
                 f"No parquet episodes found under dataset root '{self.dataset_root}'."
@@ -267,4 +270,5 @@ def build_libero_chunk_offline_dataset_from_cfg(cfg) -> LiberoChunkOfflineDatase
         intermediate_reward=float(dataset_cfg.get("intermediate_reward", 0.0)),
         camera_name=str(dataset_cfg.get("camera_name", "image")),
         state_key=str(dataset_cfg.get("state_key", "state")),
+        max_episodes=dataset_cfg.get("max_episodes", None),
     )

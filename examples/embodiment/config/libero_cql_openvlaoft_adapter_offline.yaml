@@ -9,8 +9,6 @@ hydra:
   run:
     dir: .
   output_subdir: null
-  searchpath:
-    - file://${oc.env:EMBODIED_PATH}/config/
 
 cluster:
   num_nodes: 1
@@ -76,9 +74,10 @@ algorithm:
 
   offline_rl:
     name: cql
+    share_target_model: true
     dataset:
       enable: true
-      dataset_root: "/home/wudi/temp_data/dataset"
+      dataset_root: "/workspace/data/dataset"
       chunk_size: ${actor.model.num_action_chunks}
       sample_stride: 1
       terminal_reward: 1.0
@@ -152,7 +151,7 @@ rollout:
   collect_prev_infos: False
 
   model:
-    model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
+    model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora" # "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
     precision: ${actor.model.precision}
 
 actor:
@@ -164,7 +163,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
+    model_path: "/workspace/data/model/RLinf-OpenVLAOFT-LIBERO-130-Base-Lora" # "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
     model_type: "openvla_oft"
     unnorm_key: libero_130_no_noops_trajall
     proprio_dim: 8

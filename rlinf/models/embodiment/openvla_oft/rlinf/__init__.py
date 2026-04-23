@@ -106,4 +106,22 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     model_config, input_processor = get_model_config_and_input_processor(cfg)
     model.setup_config_and_processor(model_config, input_processor)
 
+    tokenizer = input_processor.tokenizer
+    embedding_layer = model.get_input_embeddings()
+    num_embeddings = embedding_layer.weight.shape[0]
+    tokenizer_size = len(tokenizer)
+    pad_token_id = tokenizer.pad_token_id
+
+    required_vocab_size = tokenizer_size
+    if pad_token_id is not None:
+        required_vocab_size = max(required_vocab_size, int(pad_token_id) + 1)
+
+    if required_vocab_size > num_embeddings:
+        model.resize_token_embeddings(required_vocab_size)
+        embedding_layer = model.get_input_embeddings()
+
+    if pad_token_id is not None:
+        model.config.pad_token_id = int(pad_token_id)
+        embedding_layer.padding_idx = int(pad_token_id)
+
     return model
