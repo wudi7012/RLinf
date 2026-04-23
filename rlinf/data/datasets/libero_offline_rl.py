@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -26,6 +27,7 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
+from torch.utils.data import Dataset
 
 
 @dataclass
@@ -39,6 +41,18 @@ class LiberoOfflineEpisode:
     terminations: torch.Tensor
     truncations: torch.Tensor
     dones: torch.Tensor
+
+
+@dataclass
+class LiberoOfflineTransition:
+    curr_env_obs: dict[str, Any]
+    next_env_obs: dict[str, Any]
+    actions: torch.Tensor
+    rewards: torch.Tensor
+    terminations: torch.Tensor
+    truncations: torch.Tensor
+    dones: torch.Tensor
+    returns_to_go: Optional[torch.Tensor] = None
 
 
 def _decode_image_cell(image_cell: Any) -> np.ndarray:
@@ -260,6 +274,202 @@ class LiberoChunkOfflineDataset:
         )
 
 
+def _compute_returns_to_go(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    returns_to_go = torch.zeros_like(rewards, dtype=torch.float32)
+    running = torch.zeros_like(rewards[0], dtype=torch.float32)
+    for step_id in range(rewards.shape[0] - 1, -1, -1):
+        running = rewards[step_id].to(torch.float32) + gamma * running * (
+            ~dones[step_id]
+        ).to(torch.float32)
+        returns_to_go[step_id] = running
+    return returns_to_go
+
+
+class LiberoChunkTransitionDataset(Dataset):
+    """Map-style transition dataset for actor-local offline training.
+
+    This keeps the dataset in raw environment space and materializes model-ready
+    observations on the actor at training time. That matches classic offline RL
+    more closely and avoids startup-time replay-buffer preload.
+    """
+
+    def __init__(
+        self,
+        dataset_root: str,
+        chunk_size: int = 8,
+        sample_stride: int = 1,
+        terminal_reward: float = 1.0,
+        intermediate_reward: float = 0.0,
+        camera_name: str = "image",
+        state_key: str = "state",
+        max_episodes: Optional[int] = None,
+        returns_to_go_gamma: Optional[float] = None,
+        episode_cache_size: int = 2,
+    ) -> None:
+        self.episode_dataset = LiberoChunkOfflineDataset(
+            dataset_root=dataset_root,
+            chunk_size=chunk_size,
+            sample_stride=sample_stride,
+            terminal_reward=terminal_reward,
+            intermediate_reward=intermediate_reward,
+            camera_name=camera_name,
+            state_key=state_key,
+            max_episodes=max_episodes,
+        )
+        self.returns_to_go_gamma = returns_to_go_gamma
+        self.episode_cache_size = max(1, int(episode_cache_size))
+        self._episode_cache: OrderedDict[
+            int, tuple[LiberoOfflineEpisode, Optional[torch.Tensor]]
+        ] = OrderedDict()
+        self._transition_index: list[tuple[int, int]] = []
+        self._build_transition_index()
+
+    def _get_num_frames(self, file_path: Path) -> int:
+        try:
+            import pyarrow.parquet as pq
+
+            return int(pq.ParquetFile(file_path).metadata.num_rows)
+        except Exception:
+            df = pd.read_parquet(file_path, columns=["actions"])
+            return int(len(df))
+
+    def _build_transition_index(self) -> None:
+        chunk_size = self.episode_dataset.chunk_size
+        sample_stride = self.episode_dataset.sample_stride
+        for episode_offset, file_path in enumerate(self.episode_dataset._episode_files):
+            num_frames = self._get_num_frames(file_path)
+            if num_frames < chunk_size:
+                continue
+            last_start = num_frames - chunk_size
+            start_indices = list(range(0, last_start + 1, sample_stride))
+            if not start_indices or start_indices[-1] != last_start:
+                start_indices.append(last_start)
+            for transition_idx in range(len(start_indices)):
+                self._transition_index.append((episode_offset, transition_idx))
+
+    def __len__(self) -> int:
+        return len(self._transition_index)
+
+    def _get_cached_episode(
+        self,
+        episode_offset: int,
+    ) -> tuple[LiberoOfflineEpisode, Optional[torch.Tensor]]:
+        cached = self._episode_cache.get(episode_offset, None)
+        if cached is not None:
+            self._episode_cache.move_to_end(episode_offset)
+            return cached
+
+        episode = self.episode_dataset.load_episode(episode_offset)
+        if episode is None:
+            raise RuntimeError(
+                f"Episode {episode_offset} is invalid for transition sampling."
+            )
+
+        returns_to_go = None
+        if self.returns_to_go_gamma is not None:
+            returns_to_go = _compute_returns_to_go(
+                rewards=episode.rewards,
+                dones=episode.dones,
+                gamma=float(self.returns_to_go_gamma),
+            )
+
+        cached = (episode, returns_to_go)
+        self._episode_cache[episode_offset] = cached
+        self._episode_cache.move_to_end(episode_offset)
+        while len(self._episode_cache) > self.episode_cache_size:
+            self._episode_cache.popitem(last=False)
+        return cached
+
+    def _slice_transition_env_obs(
+        self,
+        env_obs: dict[str, Any],
+        transition_idx: int,
+    ) -> dict[str, Any]:
+        sliced: dict[str, Any] = {}
+        for key, value in env_obs.items():
+            if isinstance(value, torch.Tensor):
+                sliced[key] = value[transition_idx].clone()
+            elif isinstance(value, list):
+                sliced[key] = value[transition_idx]
+            else:
+                sliced[key] = value
+        return sliced
+
+    def __getitem__(self, index: int) -> LiberoOfflineTransition:
+        episode_offset, transition_idx = self._transition_index[index]
+        episode, returns_to_go = self._get_cached_episode(episode_offset)
+        return LiberoOfflineTransition(
+            curr_env_obs=self._slice_transition_env_obs(
+                episode.curr_env_obs, transition_idx
+            ),
+            next_env_obs=self._slice_transition_env_obs(
+                episode.next_env_obs, transition_idx
+            ),
+            actions=episode.actions[transition_idx].clone(),
+            rewards=episode.rewards[transition_idx].clone(),
+            terminations=episode.terminations[transition_idx].clone(),
+            truncations=episode.truncations[transition_idx].clone(),
+            dones=episode.dones[transition_idx].clone(),
+            returns_to_go=(
+                returns_to_go[transition_idx].clone()
+                if returns_to_go is not None
+                else None
+            ),
+        )
+
+
+def _collate_env_obs_batch(env_obs_batch: list[dict[str, Any]]) -> dict[str, Any]:
+    collated: dict[str, Any] = {}
+    keys = env_obs_batch[0].keys()
+    for key in keys:
+        values = [sample[key] for sample in env_obs_batch]
+        first_value = values[0]
+        if isinstance(first_value, torch.Tensor):
+            collated[key] = torch.stack(values, dim=0)
+        elif first_value is None:
+            if not all(value is None for value in values):
+                raise ValueError(
+                    f"Mixed None / tensor values encountered for env obs key '{key}'."
+                )
+            collated[key] = None
+        elif isinstance(first_value, str):
+            collated[key] = list(values)
+        else:
+            collated[key] = list(values)
+    return collated
+
+
+def libero_offline_transition_collate_fn(
+    batch: list[LiberoOfflineTransition],
+) -> dict[str, Any]:
+    collated = {
+        "curr_env_obs": _collate_env_obs_batch(
+            [transition.curr_env_obs for transition in batch]
+        ),
+        "next_env_obs": _collate_env_obs_batch(
+            [transition.next_env_obs for transition in batch]
+        ),
+        "actions": torch.stack([transition.actions for transition in batch], dim=0),
+        "rewards": torch.stack([transition.rewards for transition in batch], dim=0),
+        "terminations": torch.stack(
+            [transition.terminations for transition in batch], dim=0
+        ),
+        "truncations": torch.stack(
+            [transition.truncations for transition in batch], dim=0
+        ),
+        "dones": torch.stack([transition.dones for transition in batch], dim=0),
+    }
+    if batch[0].returns_to_go is not None:
+        collated["returns_to_go"] = torch.stack(
+            [transition.returns_to_go for transition in batch], dim=0
+        )
+    return collated
+
+
 def build_libero_chunk_offline_dataset_from_cfg(cfg) -> LiberoChunkOfflineDataset:
     dataset_cfg = cfg.algorithm.offline_rl.dataset
     return LiberoChunkOfflineDataset(
@@ -271,4 +481,25 @@ def build_libero_chunk_offline_dataset_from_cfg(cfg) -> LiberoChunkOfflineDatase
         camera_name=str(dataset_cfg.get("camera_name", "image")),
         state_key=str(dataset_cfg.get("state_key", "state")),
         max_episodes=dataset_cfg.get("max_episodes", None),
+    )
+
+
+def build_libero_chunk_transition_dataset_from_cfg(cfg) -> LiberoChunkTransitionDataset:
+    dataset_cfg = cfg.algorithm.offline_rl.dataset
+    returns_to_go_gamma = None
+    if cfg.algorithm.offline_rl.get("name", "sac").lower() == "calql":
+        returns_to_go_gamma = cfg.algorithm.offline_rl.get("calql", {}).get(
+            "returns_to_go_gamma", 1.0
+        )
+    return LiberoChunkTransitionDataset(
+        dataset_root=str(dataset_cfg.dataset_root),
+        chunk_size=int(dataset_cfg.get("chunk_size", cfg.actor.model.num_action_chunks)),
+        sample_stride=int(dataset_cfg.get("sample_stride", 1)),
+        terminal_reward=float(dataset_cfg.get("terminal_reward", 1.0)),
+        intermediate_reward=float(dataset_cfg.get("intermediate_reward", 0.0)),
+        camera_name=str(dataset_cfg.get("camera_name", "image")),
+        state_key=str(dataset_cfg.get("state_key", "state")),
+        max_episodes=dataset_cfg.get("max_episodes", None),
+        returns_to_go_gamma=returns_to_go_gamma,
+        episode_cache_size=int(dataset_cfg.get("episode_cache_size", 2)),
     )

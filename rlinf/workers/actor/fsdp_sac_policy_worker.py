@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from rlinf.algorithms.offline_rl import (
     get_offline_rl_algo_name,
@@ -34,6 +35,8 @@ from rlinf.algorithms.offline_rl import (
 from rlinf.config import SupportedModel
 from rlinf.data.datasets.libero_offline_rl import (
     build_libero_chunk_offline_dataset_from_cfg,
+    build_libero_chunk_transition_dataset_from_cfg,
+    libero_offline_transition_collate_fn,
 )
 from rlinf.data.embodied_buffer_dataset import (
     PreloadReplayBufferDataset,
@@ -76,6 +79,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.offline_rl_name = get_offline_rl_algo_name(cfg)
         self.use_pure_offline_dataset = is_pure_offline_dataset_enabled(cfg)
         self.use_shared_target_model = False
+        self.offline_dataset = None
+        self.offline_data_loader = None
+        self.offline_data_iter = None
+        self._offline_data_epoch = 0
+        self._offline_data_iter_offset = 0
 
     def init_worker(self):
         print(
@@ -291,6 +299,24 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
     def setup_sac_components(self):
         """Initialize SAC-specific components"""
+        if self.use_pure_offline_dataset:
+            self.build_pure_offline_dataloader()
+            self.critic_actor_ratio = self.cfg.algorithm.get("critic_actor_ratio", 1)
+            self.critic_subsample_size = self.cfg.algorithm.get(
+                "critic_subsample_size", -1
+            )
+            self.critic_sample_generator = torch.Generator(self.device)
+            self.critic_sample_generator.manual_seed(
+                self.cfg.actor.get("seed", 1234)
+            )
+            self.target_update_type = self.cfg.algorithm.get(
+                "target_update_type", "all"
+            )
+            assert self.target_update_type in ["all", "q_head_only"], (
+                f"{self.target_update_type=} is not suppported!"
+            )
+            return
+
         # Initialize replay buffer
         seed = self.cfg.actor.get("seed", 1234)
         returns_to_go_gamma = None
@@ -369,9 +395,6 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         self.buffer_dataloader_iter = iter(self.buffer_dataloader)
 
-        if self.use_pure_offline_dataset:
-            self._preload_pure_offline_replay_buffer()
-
         self.critic_actor_ratio = self.cfg.algorithm.get("critic_actor_ratio", 1)
         self.critic_subsample_size = self.cfg.algorithm.get("critic_subsample_size", -1)
         self.critic_sample_generator = torch.Generator(self.device)
@@ -380,6 +403,68 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.target_update_type = self.cfg.algorithm.get("target_update_type", "all")
         assert self.target_update_type in ["all", "q_head_only"], (
             f"{self.target_update_type=} is not suppported!"
+        )
+
+    def build_pure_offline_dataloader(self) -> None:
+        dataset_cfg = self._pure_offline_dataset_cfg()
+        per_rank_batch_size = self.cfg.actor.global_batch_size // self._world_size
+        if per_rank_batch_size < 1:
+            raise ValueError(
+                f"Per-rank offline batch size must be >= 1, got {per_rank_batch_size}."
+            )
+
+        self.offline_dataset = build_libero_chunk_transition_dataset_from_cfg(self.cfg)
+        if len(self.offline_dataset) < per_rank_batch_size:
+            raise ValueError(
+                f"Offline dataset size ({len(self.offline_dataset)}) must be >= "
+                f"per-rank batch size ({per_rank_batch_size})."
+            )
+
+        sampler = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            sampler = DistributedSampler(
+                self.offline_dataset,
+                num_replicas=self._world_size,
+                rank=self._rank,
+                shuffle=bool(dataset_cfg.get("shuffle", True)),
+                seed=int(dataset_cfg.get("seed", self.cfg.actor.get("seed", 1234))),
+                drop_last=True,
+            )
+
+        num_workers = int(dataset_cfg.get("num_workers", 0))
+        pin_memory = bool(dataset_cfg.get("pin_memory", True))
+        persistent_workers = num_workers > 0 and bool(
+            dataset_cfg.get("persistent_workers", True)
+        )
+
+        self.offline_data_loader = DataLoader(
+            self.offline_dataset,
+            batch_size=per_rank_batch_size,
+            sampler=sampler,
+            shuffle=(sampler is None),
+            num_workers=num_workers,
+            drop_last=True,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            collate_fn=libero_offline_transition_collate_fn,
+        )
+        self._offline_data_epoch = 0
+        self._offline_data_iter_offset = 0
+        if sampler is not None:
+            sampler.set_epoch(self._offline_data_epoch)
+        self.offline_data_iter = iter(self.offline_data_loader)
+
+        self.log_info(
+            "Pure offline dataloader setup: "
+            f"rank={self._rank} dataset_size={len(self.offline_dataset)} "
+            f"per_rank_batch_size={per_rank_batch_size} num_workers={num_workers}"
+        )
+        print(
+            "[offline-dataloader] "
+            f"rank={self._rank} dataset_size={len(self.offline_dataset)} "
+            f"per_rank_batch_size={per_rank_batch_size} num_workers={num_workers}",
+            file=sys.stderr,
+            flush=True,
         )
 
     def _pure_offline_dataset_cfg(self):
@@ -450,6 +535,93 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 }
             )
         return kwargs
+
+    def _next_pure_offline_batch(self) -> dict[str, Any]:
+        if self.offline_data_iter is None:
+            raise RuntimeError("Pure offline DataLoader is not initialized.")
+        try:
+            batch = next(self.offline_data_iter)
+            self._offline_data_iter_offset += 1
+        except StopIteration:
+            self._offline_data_epoch += 1
+            sampler = getattr(self.offline_data_loader, "sampler", None)
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(self._offline_data_epoch)
+            self.offline_data_iter = iter(self.offline_data_loader)
+            batch = next(self.offline_data_iter)
+            self._offline_data_iter_offset = 1
+        return batch
+
+    def _prepare_pure_offline_batch(
+        self,
+        raw_batch: dict[str, Any],
+    ) -> dict[str, Any]:
+        transition_kwargs = self._build_pure_offline_transition_kwargs()
+        preprocess_model = self.model.module if isinstance(self.model, FSDP) else self.model
+        fsdp_full_param_ctx = (
+            FSDP.summon_full_params(self.model, writeback=False, recurse=True)
+            if isinstance(self.model, FSDP)
+            else nullcontext()
+        )
+
+        was_training = self.model.training
+        self.model.eval()
+        with fsdp_full_param_ctx:
+            with torch.no_grad():
+                curr_transition_obs = preprocess_model.build_transition_obs(
+                    env_obs=raw_batch["curr_env_obs"],
+                    **transition_kwargs,
+                )
+                next_transition_obs = preprocess_model.build_transition_obs(
+                    env_obs=raw_batch["next_env_obs"],
+                    **transition_kwargs,
+                )
+        self.model.train(was_training)
+
+        actions = raw_batch["actions"].to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        if hasattr(preprocess_model, "_delta_to_policy_action"):
+            base_flat = curr_transition_obs["base_actions"].flatten(start_dim=1).to(
+                dtype=actions.dtype
+            )
+            delta_actions = actions.view(actions.shape[0], -1) - base_flat
+            actions = preprocess_model._delta_to_policy_action(
+                delta_actions,
+                curr_transition_obs["base_actions"],
+            ).to(dtype=torch.float32)
+
+        batch = {
+            "curr_obs": curr_transition_obs,
+            "next_obs": next_transition_obs,
+            "actions": actions,
+            "rewards": raw_batch["rewards"].to(
+                device=self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            ),
+            "terminations": raw_batch["terminations"].to(
+                device=self.device,
+                non_blocking=True,
+            ),
+            "truncations": raw_batch["truncations"].to(
+                device=self.device,
+                non_blocking=True,
+            ),
+            "dones": raw_batch["dones"].to(
+                device=self.device,
+                non_blocking=True,
+            ),
+        }
+        if "returns_to_go" in raw_batch:
+            batch["returns_to_go"] = raw_batch["returns_to_go"].to(
+                device=self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+        return batch
 
     def _build_pure_offline_trajectory(
         self,
@@ -1213,7 +1385,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
 
         with self.worker_timer("sample"):
-            global_batch = next(self.buffer_dataloader_iter)
+            if self.use_pure_offline_dataset:
+                global_batch = self._prepare_pure_offline_batch(
+                    self._next_pure_offline_batch()
+                )
+            else:
+                global_batch = next(self.buffer_dataloader_iter)
 
         train_micro_batch_list = split_dict_to_chunk(
             global_batch,
@@ -1359,11 +1536,21 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         return metrics_data
 
     def process_train_metrics(self, metrics):
-        replay_buffer_stats = self.replay_buffer.get_stats()
-        replay_buffer_stats = {
-            f"replay_buffer/{key}": value for key, value in replay_buffer_stats.items()
-        }
-        append_to_dict(metrics, replay_buffer_stats)
+        if self.use_pure_offline_dataset:
+            append_to_dict(
+                metrics,
+                {
+                    "offline_data/epoch": self._offline_data_epoch,
+                    "offline_data/iter_offset": self._offline_data_iter_offset,
+                },
+            )
+        if self.replay_buffer is not None:
+            replay_buffer_stats = self.replay_buffer.get_stats()
+            replay_buffer_stats = {
+                f"replay_buffer/{key}": value
+                for key, value in replay_buffer_stats.items()
+            }
+            append_to_dict(metrics, replay_buffer_stats)
 
         if self.demo_buffer is not None:
             demo_buffer_stats = self.demo_buffer.get_stats()
@@ -1402,18 +1589,21 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)
 
-        # Check if replay buffer has enough samples
-        min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
-        if not self.replay_buffer.is_ready(min_buffer_size):
-            self.log_on_first_rank(
-                f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
+        if self.use_pure_offline_dataset:
+            train_actor = True
+        else:
+            min_buffer_size = self.cfg.algorithm.replay_buffer.get(
+                "min_buffer_size", 100
             )
-            return {}
+            if not self.replay_buffer.is_ready(min_buffer_size):
+                self.log_on_first_rank(
+                    f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
+                )
+                return {}
 
-        # Delay actor training until buffer has enough samples
-        train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
-        train_actor_steps = max(min_buffer_size, train_actor_steps)
-        train_actor = self.replay_buffer.is_ready(train_actor_steps)
+            train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
+            train_actor_steps = max(min_buffer_size, train_actor_steps)
+            train_actor = self.replay_buffer.is_ready(train_actor_steps)
 
         assert (
             self.cfg.actor.global_batch_size
@@ -1504,11 +1694,23 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 os.path.join(target_model_save_path, f"checkpoint_rank_{self._rank}.pt"),
             )
 
-        # save replay buffer
-        buffer_save_path = os.path.join(
-            save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
-        )
-        self.replay_buffer.save_checkpoint(buffer_save_path)
+        if self.replay_buffer is not None:
+            buffer_save_path = os.path.join(
+                save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+            )
+            self.replay_buffer.save_checkpoint(buffer_save_path)
+        if self.use_pure_offline_dataset:
+            offline_state_path = os.path.join(
+                save_base_path, f"sac_components/offline_data/rank_{self._rank}.pt"
+            )
+            os.makedirs(os.path.dirname(offline_state_path), exist_ok=True)
+            torch.save(
+                {
+                    "data_epoch": int(self._offline_data_epoch),
+                    "data_iter_offset": int(self._offline_data_iter_offset),
+                },
+                offline_state_path,
+            )
 
     def load_checkpoint(self, load_base_path):
         # load model
@@ -1556,8 +1758,31 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 full_state_dict=True,
             )
 
-        # load replay buffer
-        buffer_load_path = os.path.join(
-            load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
-        )
-        self.replay_buffer.load_checkpoint(buffer_load_path)
+        if self.replay_buffer is not None:
+            buffer_load_path = os.path.join(
+                load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
+            )
+            self.replay_buffer.load_checkpoint(buffer_load_path)
+        if self.use_pure_offline_dataset:
+            offline_state_path = os.path.join(
+                load_base_path, f"sac_components/offline_data/rank_{self._rank}.pt"
+            )
+            if os.path.exists(offline_state_path):
+                state_payload = torch.load(offline_state_path, map_location="cpu")
+                self._offline_data_epoch = int(state_payload.get("data_epoch", 0))
+                self._offline_data_iter_offset = int(
+                    state_payload.get("data_iter_offset", 0)
+                )
+                if self.offline_data_loader is not None:
+                    sampler = getattr(self.offline_data_loader, "sampler", None)
+                    if sampler is not None and hasattr(sampler, "set_epoch"):
+                        sampler.set_epoch(self._offline_data_epoch)
+                    self.offline_data_iter = iter(self.offline_data_loader)
+                    for _ in range(self._offline_data_iter_offset):
+                        try:
+                            next(self.offline_data_iter)
+                        except StopIteration:
+                            self._offline_data_epoch += 1
+                            if sampler is not None and hasattr(sampler, "set_epoch"):
+                                sampler.set_epoch(self._offline_data_epoch)
+                            self.offline_data_iter = iter(self.offline_data_loader)

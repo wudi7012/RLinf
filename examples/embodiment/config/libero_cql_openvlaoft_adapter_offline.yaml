@@ -82,8 +82,6 @@ algorithm:
       sample_stride: 1
       terminal_reward: 1.0
       intermediate_reward: 0.0
-      preprocess_batch_size: 16
-      shard_by_rank: true
       base_do_sample: true
       base_temperature: ${algorithm.sampling_params.temperature_train}
     cql:

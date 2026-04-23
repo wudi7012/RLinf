@@ -24,11 +24,7 @@ algorithm:
 
   offline_rl:
     dataset:
-      preprocess_batch_size: 4
-      shard_by_rank: true
       max_episodes: 8
-      log_every_episodes: 1
-      log_every_batches: 5
 
 actor:
   micro_batch_size: 1
