@@ -23,12 +23,12 @@ runner:
     experiment_name: "libero_grpo_openvlaoft_adapter_our_offline"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 1000
+  max_epochs: 250
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 250
-  save_interval: 250
+  val_check_interval: 50
+  save_interval: 50
 
   resume_dir: null
   ckpt_path: null
@@ -174,7 +174,7 @@ adapter:
   init_log_std: -2.0
 
 adapter_reward:
-  type: absolute
+  type: improvement
   error_fn: mae
   residual_penalty: l1
   residual_coef: 0.01

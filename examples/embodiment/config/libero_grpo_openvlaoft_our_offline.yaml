@@ -23,12 +23,12 @@ runner:
     experiment_name: "libero_grpo_openvlaoft_our_offline"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 1000
+  max_epochs: 10
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 250
-  save_interval: 250
+  val_check_interval: 5
+  save_interval: 5
 
   resume_dir: null
   ckpt_path: null
@@ -127,7 +127,7 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 16
-  global_batch_size: 64
+  global_batch_size: 128
   seed: 1234
   enable_offload: True
 

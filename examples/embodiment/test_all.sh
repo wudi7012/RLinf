@@ -15,12 +15,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PATH="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-CONFIG_NAME="libero_130_grpo_openvlaoft_adapter_eval"
+CONFIG_NAME="libero_130_grpo_openvlaoft_adapter_eval_2"
 CONFIG_FILE="${SCRIPT_DIR}/config/${CONFIG_NAME}.yaml"
 EVAL_SCRIPT="${SCRIPT_DIR}/eval_embodiment.sh"
 
 # 你要跑的 5 组：第一组用 null，后四组用 global_step_xxx。
-RUN_LABELS=("null" "50" "100" "150" "200")
+RUN_LABELS=("null" "50" "100" "150" "200" "250")
 
 # -------------------------
 # 工具函数

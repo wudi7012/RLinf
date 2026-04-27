@@ -3,8 +3,8 @@
 export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 
-export MUJOCO_GL="egl"
-export PYOPENGL_PLATFORM="egl"
+export MUJOCO_GL="osmesa"
+export PYOPENGL_PLATFORM="osmesa"
 
 export ROBOTWIN_PATH=${ROBOTWIN_PATH:-"/path/to/RoboTwin"}
 export PYTHONPATH=${REPO_PATH}:${ROBOTWIN_PATH}:$PYTHONPATH
@@ -38,7 +38,7 @@ ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
 
 export ROBOT_PLATFORM
 # NCCL Debug
-export NCCL_P2P_DISABLE=1  # 禁用P2P通信
+# export NCCL_P2P_DISABLE=1  # 禁用P2P通信
 
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
 

@@ -33,7 +33,7 @@ runner:
   save_interval: 25
 
   resume_dir: null
-  ckpt_path: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260415-06:34:32-libero_grpo_openvlaoft_adapter_offline_absolute/libero_grpo_openvlaoft_adapter_offline/checkpoints/global_step_200/actor/model_state_dict/full_weights.pt
+  ckpt_path: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260416-08:41:12-libero_grpo_openvlaoft_adapter_offline/libero_grpo_openvlaoft_adapter_offline_absolute/checkpoints/global_step_150/actor/model_state_dict/full_weights.pt
 
 algorithm:
   normalize_advantages: True
