@@ -53,6 +53,7 @@ class LiberoOfflineTransition:
     truncations: torch.Tensor
     dones: torch.Tensor
     returns_to_go: Optional[torch.Tensor] = None
+    next_returns_to_go: Optional[torch.Tensor] = None
 
 
 def _decode_image_cell(image_cell: Any) -> np.ndarray:
@@ -402,6 +403,12 @@ class LiberoChunkTransitionDataset(Dataset):
     def __getitem__(self, index: int) -> LiberoOfflineTransition:
         episode_offset, transition_idx = self._transition_index[index]
         episode, returns_to_go = self._get_cached_episode(episode_offset)
+        next_returns_to_go = None
+        if returns_to_go is not None:
+            if transition_idx + 1 < returns_to_go.shape[0]:
+                next_returns_to_go = returns_to_go[transition_idx + 1].clone()
+            else:
+                next_returns_to_go = torch.zeros_like(returns_to_go[transition_idx])
         return LiberoOfflineTransition(
             curr_env_obs=self._slice_transition_env_obs(
                 episode.curr_env_obs, transition_idx
@@ -419,6 +426,7 @@ class LiberoChunkTransitionDataset(Dataset):
                 if returns_to_go is not None
                 else None
             ),
+            next_returns_to_go=next_returns_to_go,
         )
 
 
@@ -466,6 +474,10 @@ def libero_offline_transition_collate_fn(
     if batch[0].returns_to_go is not None:
         collated["returns_to_go"] = torch.stack(
             [transition.returns_to_go for transition in batch], dim=0
+        )
+    if batch[0].next_returns_to_go is not None:
+        collated["next_returns_to_go"] = torch.stack(
+            [transition.next_returns_to_go for transition in batch], dim=0
         )
     return collated
 

@@ -505,6 +505,13 @@ class MultiStepRolloutWorker(Worker):
                 .cpu()
                 .contiguous()
             )
+        if "next_returns_to_go" in raw_batch:
+            batch["next_returns_to_go"] = (
+                raw_batch["next_returns_to_go"]
+                .to(dtype=torch.float32)
+                .cpu()
+                .contiguous()
+            )
         return batch
 
     def prepare_pure_offline_train_batches(self, num_batches: int) -> list[dict[str, Any]]:

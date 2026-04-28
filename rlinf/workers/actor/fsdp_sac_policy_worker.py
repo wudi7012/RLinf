@@ -756,16 +756,23 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         if self.offline_rl_name == "calql":
             returns_to_go = batch.get("returns_to_go", None)
-            if returns_to_go is None:
+            next_returns_to_go = batch.get("next_returns_to_go", None)
+            if returns_to_go is None or next_returns_to_go is None:
                 raise RuntimeError(
-                    "Cal-QL requires returns_to_go in replay batches, but it was missing."
+                    "Cal-QL requires both returns_to_go and next_returns_to_go in replay batches."
                 )
             returns_to_go = returns_to_go.to(curr_action_values.device)
+            next_returns_to_go = next_returns_to_go.to(next_action_values.device)
             if returns_to_go.ndim == 1:
                 returns_to_go = returns_to_go.unsqueeze(-1)
+            if next_returns_to_go.ndim == 1:
+                next_returns_to_go = next_returns_to_go.unsqueeze(-1)
             returns_to_go = returns_to_go.transpose(0, 1).unsqueeze(-1)
+            next_returns_to_go = next_returns_to_go.transpose(0, 1).unsqueeze(-1)
             curr_action_values = torch.maximum(curr_action_values, returns_to_go)
-            next_action_values = torch.maximum(next_action_values, returns_to_go)
+            next_action_values = torch.maximum(
+                next_action_values, next_returns_to_go
+            )
 
         target_values = torch.cat(
             [
