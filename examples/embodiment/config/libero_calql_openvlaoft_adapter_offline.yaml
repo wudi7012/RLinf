@@ -9,4 +9,4 @@ algorithm:
   offline_rl:
     name: calql
     calql:
-      returns_to_go_gamma: 1.0
+      returns_to_go_gamma: 0.99
