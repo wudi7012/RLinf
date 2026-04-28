@@ -1,0 +1,43 @@
+defaults:
+  - libero_sac_openvlaoft_adapter_online
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 0,5
+
+runner:
+  logger:
+    experiment_name: "libero_sac_openvlaoft_adapter_online_2gpu_min"
+
+  max_epochs: 10
+  log_interval: 5
+  save_interval: 50
+  val_check_interval: -1
+
+algorithm:
+  update_epoch: 4
+
+  replay_buffer:
+    cache_size: 512
+    sample_window_size: 512
+    min_buffer_size: 8
+
+env:
+  train:
+    total_num_envs: 8
+    max_steps_per_rollout_epoch: 16
+  eval:
+    total_num_envs: 2
+
+rollout:
+  enable_offload: true
+
+actor:
+  micro_batch_size: 2
+  global_batch_size: 4
+  enable_offload: true
+
+  fsdp_config:
+    gradient_checkpointing: true
+

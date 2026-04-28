@@ -1,0 +1,36 @@
+defaults:
+  - libero_sac_openvlaoft_adapter_online
+
+runner:
+  logger:
+    experiment_name: "libero_130_sac_openvlaoft_adapter_eval"
+
+  only_eval: True
+  val_check_interval: -1
+  save_interval: 25
+
+  resume_dir: null
+  ckpt_path: null
+
+rollout:
+  collect_transitions: False
+
+env:
+  train:
+    total_num_envs: 64
+
+  eval:
+    total_num_envs: 32
+    auto_reset: True
+    ignore_terminations: True
+    group_size: 1
+    max_episode_steps: 512
+    max_steps_per_rollout_epoch: 2048
+    use_fixed_reset_state_ids: True
+    use_ordered_reset_state_ids: True
+    reset_gripper_open: False
+    is_eval: True
+    video_cfg:
+      save_video: True
+      info_on_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval

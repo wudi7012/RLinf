@@ -1,0 +1,211 @@
+defaults:
+  - env/libero_130@env.train
+  - env/libero_130@env.eval
+  - model/openvla_oft@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_sac_openvlaoft_adapter_online"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1000
+  max_steps: -1
+  log_interval: 10
+
+  only_eval: False
+  val_check_interval: 50
+  save_interval: 100
+
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  update_epoch: 16
+  group_size: 1
+  agg_q: min
+  actor_agg_q: mean
+  backup_entropy: True
+  critic_subsample_size: 0
+  critic_actor_ratio: 1
+  target_update_type: q_head_only
+
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+
+  adv_type: embodied_sac
+  loss_type: embodied_sac
+  loss_agg_func: "token-mean"
+
+  bootstrap_type: standard
+  gamma: 0.99
+  tau: 0.005
+
+  entropy_tuning:
+    alpha_type: softplus
+    initial_alpha: 0.01
+    target_entropy: -56
+    optim:
+      lr: 1.0e-4
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+
+  replay_buffer:
+    enable_cache: True
+    cache_size: 2000
+    sample_window_size: 2000
+    min_buffer_size: 64
+    auto_save: False
+
+  target_update_freq: 1
+
+  offline_rl:
+    name: sac
+    share_target_model: false
+
+  sampling_params:
+    do_sample: True
+    temperature_train: 1.6
+    temperature_eval: 1.6
+    top_k: -1
+    top_p: 1.0
+    repetition_penalty: 1.0
+
+  length_params:
+    max_new_token: null
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: "EnvGroup"
+
+  train:
+    total_num_envs: 64
+    auto_reset: True
+    ignore_terminations: True
+    group_size: 1
+    max_episode_steps: 512
+    max_steps_per_rollout_epoch: 64
+    use_fixed_reset_state_ids: False
+    use_ordered_reset_state_ids: False
+    reset_gripper_open: False
+    is_eval: False
+    video_cfg:
+      save_video: False
+      info_on_video: False
+      video_base_dir: ${runner.logger.log_path}/video/train
+
+  eval:
+    total_num_envs: 32
+    auto_reset: True
+    ignore_terminations: True
+    group_size: 1
+    max_episode_steps: 512
+    max_steps_per_rollout_epoch: 512
+    use_fixed_reset_state_ids: True
+    use_ordered_reset_state_ids: True
+    reset_gripper_open: False
+    is_eval: True
+    video_cfg:
+      save_video: True
+      info_on_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+  collect_transitions: True
+  collect_prev_infos: False
+
+  model:
+    model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16
+  global_batch_size: 64
+  seed: 1234
+  enable_offload: False
+
+  model:
+    model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"
+    model_type: "openvla_oft"
+    unnorm_key: libero_130_no_noops_trajall
+    proprio_dim: 8
+    max_prompt_length: 128
+    add_value_head: False
+    adapter: ${adapter}
+    vla: ${vla}
+
+  optim:
+    lr: 2.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 1.0
+    lr_scheduler: torch_constant
+
+  critic_optim:
+    lr: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 0.0
+    clip_grad: 10.0
+    lr_scheduler: torch_constant
+
+  fsdp_config:
+    strategy: "fsdp"
+    gradient_checkpointing: False
+    use_orig_params: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
+
+adapter:
+  enable: true
+  type: residual_chunk_adapter
+  hidden_dim: 512
+  num_layers: 3
+  use_layernorm: true
+  residual_bound: 0.5
+  std_mode: global_learnable
+  init_log_std: -2.0
+  offline_rl_action_space: final
+  add_q_head: true
+  add_value_head: false
+  q_head_type: default
+  q_head_hidden_dims: [512, 256, 256]
+  value_head_hidden_dims: [512, 256]
+
+vla:
+  freeze_backbone: true
+  freeze_action_head: true
+  feature_type: pooled_last_hidden
+  use_base_action: true
