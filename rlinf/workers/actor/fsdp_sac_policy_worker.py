@@ -614,6 +614,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         next_obs = batch["next_obs"]
         actions = batch["actions"]
 
+        dsrl_kwargs = {"train": True} if use_dsrl else {}
         with torch.no_grad():
             next_state_actions, next_state_log_pi, _ = self.model(
                 forward_type=ForwardType.SAC,
@@ -623,7 +624,6 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             next_state_log_pi = self._sum_action_logprobs(next_state_log_pi)
 
             if not use_crossq:
-                dsrl_kwargs = {"train": True} if use_dsrl else {}
                 all_qf_next_target = self.target_model(
                     forward_type=ForwardType.SAC_Q,
                     obs=next_obs,
@@ -661,36 +661,37 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 else:
                     raise NotImplementedError(f"{bootstrap_type=} is not supported!")
 
-                all_data_q_values = self.model(
-                    forward_type=ForwardType.SAC_Q,
-                    obs=curr_obs,
-                    actions=actions,
-                    **dsrl_kwargs,
+        if not use_crossq:
+            all_data_q_values = self.model(
+                forward_type=ForwardType.SAC_Q,
+                obs=curr_obs,
+                actions=actions,
+                **dsrl_kwargs,
+            )
+        else:
+            all_data_q_values, all_qf_next = self.model(
+                forward_type=ForwardType.CROSSQ_Q,
+                obs=curr_obs,
+                actions=actions,
+                next_obs=next_obs,
+                next_actions=next_state_actions,
+            )
+            all_qf_next = all_qf_next.detach()
+            qf_next = self._aggregate_q_values(all_qf_next, agg_q)
+            if self.cfg.algorithm.get("backup_entropy", True):
+                qf_next = qf_next - self.entropy_temp.alpha * next_state_log_pi
+                qf_next = qf_next.to(dtype=self.torch_dtype)
+            if bootstrap_type == "always":
+                target_q_values = rewards_for_bootstrap + discount * qf_next
+            elif bootstrap_type == "standard":
+                target_q_values = (
+                    rewards_for_bootstrap
+                    + (~(terminations.any(dim=-1, keepdim=True)))
+                    * discount
+                    * qf_next
                 )
             else:
-                all_data_q_values, all_qf_next = self.model(
-                    forward_type=ForwardType.CROSSQ_Q,
-                    obs=curr_obs,
-                    actions=actions,
-                    next_obs=next_obs,
-                    next_actions=next_state_actions,
-                )
-                all_qf_next = all_qf_next.detach()
-                qf_next = self._aggregate_q_values(all_qf_next, agg_q)
-                if self.cfg.algorithm.get("backup_entropy", True):
-                    qf_next = qf_next - self.entropy_temp.alpha * next_state_log_pi
-                    qf_next = qf_next.to(dtype=self.torch_dtype)
-                if bootstrap_type == "always":
-                    target_q_values = rewards_for_bootstrap + discount * qf_next
-                elif bootstrap_type == "standard":
-                    target_q_values = (
-                        rewards_for_bootstrap
-                        + (~(terminations.any(dim=-1, keepdim=True)))
-                        * discount
-                        * qf_next
-                    )
-                else:
-                    raise NotImplementedError(f"{bootstrap_type=} is not supported!")
+                raise NotImplementedError(f"{bootstrap_type=} is not supported!")
 
         return target_q_values, all_data_q_values, next_state_log_pi
 

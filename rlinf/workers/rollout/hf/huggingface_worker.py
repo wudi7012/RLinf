@@ -602,9 +602,6 @@ class MultiStepRolloutWorker(Worker):
                         mode="train",
                     )
 
-                env_output["obs"].pop("task_descriptions", None)
-                if env_output["final_obs"] is not None:
-                    env_output["final_obs"].pop("task_descriptions", None)
                 chunk_step_result = ChunkStepResult(
                     actions=result["forward_inputs"].get("action", None),
                     dones=dones,
@@ -650,10 +647,6 @@ class MultiStepRolloutWorker(Worker):
             dones, rewards = self.get_dones_and_rewards(env_output)
 
             _, result = self.predict(env_output["obs"])
-
-            env_output["obs"].pop("task_descriptions", None)
-            if env_output["final_obs"] is not None:
-                env_output["final_obs"].pop("task_descriptions", None)
 
             chunk_step_result = ChunkStepResult(
                 dones=dones,
