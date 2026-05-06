@@ -102,6 +102,7 @@ env:
     max_steps_per_rollout_epoch: 64
     use_fixed_reset_state_ids: False
     use_ordered_reset_state_ids: False
+    specific_reset_id: 0  # set to an integer to lock training to one reset_state_id (single task + single trial)
     reset_gripper_open: False
     is_eval: False
     video_cfg:
@@ -118,6 +119,7 @@ env:
     max_steps_per_rollout_epoch: 512
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
+    specific_reset_id: 0  # set the same integer as train if you also want single-reset evaluation
     reset_gripper_open: False
     is_eval: True
     video_cfg:
