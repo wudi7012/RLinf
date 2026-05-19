@@ -26,9 +26,8 @@ from rlinf.models.embodiment.modules.q_head import MultiQHead
 from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.models.vla_adapter.base_feature_extractor import (
     VLAAdapterFeatures,
-    attach_base_actions,
-    extract_features_from_env_obs,
     extract_features_from_forward_inputs,
+    extract_features_from_prediction_result,
 )
 
 
@@ -320,9 +319,11 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
             calculate_values=False,
             **kwargs,
         )
-        extracted = attach_base_actions(
-            extract_features_from_env_obs(self.base_vla, env_obs),
+        extracted = extract_features_from_prediction_result(
+            self.base_vla,
+            env_obs,
             base_chunk_actions,
+            base_result,
         )
         transition_obs = self._build_transition_obs_from_extracted(extracted)
         for key, value in base_result["forward_inputs"].items():
@@ -348,15 +349,17 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
             )
         if "input_ids" in obs:
             return extract_features_from_forward_inputs(self.base_vla, obs)
-        base_chunk_actions, _ = self.base_vla.predict_action_batch(
+        base_chunk_actions, base_result = self.base_vla.predict_action_batch(
             env_obs=obs,
             calculate_logprobs=False,
             calculate_values=False,
             **kwargs,
         )
-        return attach_base_actions(
-            extract_features_from_env_obs(self.base_vla, obs),
+        return extract_features_from_prediction_result(
+            self.base_vla,
+            obs,
             base_chunk_actions,
+            base_result,
         )
 
     def _delta_to_policy_action(
@@ -454,9 +457,11 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
             calculate_values=False,
             **kwargs,
         )
-        extracted = attach_base_actions(
-            extract_features_from_env_obs(self.base_vla, env_obs),
+        extracted = extract_features_from_prediction_result(
+            self.base_vla,
+            env_obs,
             base_chunk_actions,
+            base_result,
         )
         adapter_inputs = self._build_adapter_inputs(
             extracted.features,

@@ -500,10 +500,26 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
 
         forward_inputs["action_tokens"] = action_tokens
 
+        batch_size = last_hidden_states.shape[0]
+        device = last_hidden_states.device
+        start_indices = (num_patches + num_prompt_tokens).unsqueeze(1)
+        position_offsets = torch.arange(
+            self.action_dim * self.num_action_chunks,
+            device=device,
+        ).unsqueeze(0)
+        adapter_hidden_states = last_hidden_states[
+            torch.arange(batch_size, device=device).unsqueeze(-1),
+            start_indices + position_offsets,
+            :,
+        ]
+
         result = {
             "prev_logprobs": chunk_logprobs,
             "prev_values": chunk_values,
             "forward_inputs": forward_inputs,
+            "adapter_features": adapter_hidden_states.mean(dim=1).to(
+                dtype=torch.float32
+            ),
         }
 
         return chunk_actions, result

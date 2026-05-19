@@ -327,6 +327,30 @@ def attach_base_actions(
     )
 
 
+def extract_features_from_prediction_result(
+    base_model,
+    env_obs: dict[str, Any],
+    base_actions: np.ndarray | torch.Tensor,
+    prediction_result: dict[str, Any],
+) -> VLAAdapterFeatures:
+    """Reuse adapter features returned by base VLA rollout inference when available."""
+    adapter_features = prediction_result.get("adapter_features")
+    if adapter_features is None:
+        return attach_base_actions(
+            extract_features_from_env_obs(base_model, env_obs),
+            base_actions,
+        )
+
+    device = next(base_model.parameters()).device
+    features = adapter_features.to(device=device, dtype=torch.float32)
+    return VLAAdapterFeatures(
+        features=features,
+        base_actions=_to_base_action_tensor(base_actions, device=device),
+        states=_env_states_to_device(env_obs, device),
+        forward_inputs=prediction_result["forward_inputs"],
+    )
+
+
 def extract_features_from_forward_inputs(
     base_model,
     forward_inputs: dict[str, torch.Tensor],

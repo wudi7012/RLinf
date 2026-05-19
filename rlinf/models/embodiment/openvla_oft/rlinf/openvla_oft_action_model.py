@@ -427,6 +427,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             "prev_logprobs": chunk_logprobs,
             "prev_values": chunk_values,
             "forward_inputs": forward_inputs,
+            "adapter_features": last_hidden_states.mean(dim=1).to(dtype=torch.float32),
         }
 
         return chunk_actions, result
