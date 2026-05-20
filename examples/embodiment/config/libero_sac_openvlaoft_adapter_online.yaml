@@ -23,16 +23,16 @@ runner:
     experiment_name: "libero_sac_openvlaoft_adapter_online"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 1000
+  max_epochs: 10000
   max_steps: -1
   log_interval: 10
 
   only_eval: False
-  val_check_interval: 50
-  save_interval: 100
+  val_check_interval: 200
+  save_interval: -1
 
   resume_dir: null
-  ckpt_path: null
+  ckpt_path: null # /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260428-09:05:17-libero_calql_openvlaoft_adapter_offline/libero_calql_openvlaoft_adapter_offline/checkpoints/global_step_150/actor/model_state_dict/full_weights.pt
 
 algorithm:
   update_epoch: 16
@@ -123,7 +123,7 @@ env:
     reset_gripper_open: False
     is_eval: True
     video_cfg:
-      save_video: True
+      save_video: False
       info_on_video: False
       video_base_dir: ${runner.logger.log_path}/video/eval
 

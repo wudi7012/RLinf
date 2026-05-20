@@ -33,7 +33,7 @@ runner:
   save_interval: 25
 
   resume_dir: null
-  ckpt_path: null
+  ckpt_path: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260505-03:23:55-libero_sac_openvlaoft_adapter_online/libero_sac_openvlaoft_adapter_online/checkpoints/global_step_200/actor/model_state_dict/full_weights.pt
 
 algorithm:
   update_epoch: 16
