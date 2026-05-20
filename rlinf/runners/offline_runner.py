@@ -155,12 +155,12 @@ class OfflineRunner:
         if self.env is None or self.rollout is None:
             raise RuntimeError("Env/Rollout worker groups are not initialized.")
         env_handle: Handle = self.env.evaluate(
-            input_channel=self.env_channel,
-            rollout_channel=self.rollout_channel,
-        )
-        rollout_handle: Handle = self.rollout.evaluate(
             input_channel=self.rollout_channel,
             output_channel=self.env_channel,
+        )
+        rollout_handle: Handle = self.rollout.evaluate(
+            input_channel=self.env_channel,
+            output_channel=self.rollout_channel,
         )
         env_results = env_handle.wait()
         rollout_handle.wait()

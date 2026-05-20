@@ -28,7 +28,7 @@ runner:
   log_interval: 10
 
   only_eval: False
-  val_check_interval: -1
+  val_check_interval: 250
   save_interval: 250
 
   resume_dir: null
