@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +94,7 @@ class LiberoChunkOfflineDataset:
         camera_name: str = "image",
         state_key: str = "state",
         max_episodes: Optional[int] = None,
+        task_descriptions: Optional[list[str]] = None,
     ) -> None:
         self.dataset_root = Path(dataset_root).expanduser().resolve()
         self.data_root = self._resolve_data_root(self.dataset_root)
@@ -103,15 +105,28 @@ class LiberoChunkOfflineDataset:
         self.intermediate_reward = float(intermediate_reward)
         self.camera_name = camera_name
         self.state_key = state_key
+        self._task_index_to_description = self._load_task_descriptions()
+        self._task_description_filter = self._normalize_task_description_filter(
+            task_descriptions
+        )
 
         self._episode_files = sorted(self.data_root.glob("**/*.parquet"))
+        if self._task_description_filter is not None:
+            self._episode_files = self._filter_episode_files_by_task_descriptions(
+                self._episode_files
+            )
         if max_episodes is not None:
             self._episode_files = self._episode_files[: int(max_episodes)]
         if not self._episode_files:
+            filter_msg = ""
+            if self._task_description_filter is not None:
+                filter_msg = (
+                    f" matching tasks {sorted(self._task_description_filter)!r}"
+                )
             raise FileNotFoundError(
-                f"No parquet episodes found under dataset root '{self.dataset_root}'."
+                f"No parquet episodes{filter_msg} found under dataset root "
+                f"'{self.dataset_root}'."
             )
-        self._task_index_to_description = self._load_task_descriptions()
 
     @staticmethod
     def _resolve_data_root(dataset_root: Path) -> Path:
@@ -146,6 +161,101 @@ class LiberoChunkOfflineDataset:
                         continue
                     mapping[int(task_idx)] = str(task_text)
         return mapping
+
+    @staticmethod
+    def _normalize_task_description(task_description: str) -> str:
+        return " ".join(str(task_description).strip().lower().split())
+
+    def _normalize_task_description_filter(
+        self,
+        task_descriptions: Optional[list[str]],
+    ) -> Optional[set[str]]:
+        if task_descriptions is None:
+            return None
+        normalized = {
+            self._normalize_task_description(task_description)
+            for task_description in task_descriptions
+            if str(task_description).strip()
+        }
+        return normalized or None
+
+    @staticmethod
+    def _episode_index_from_path(file_path: Path) -> Optional[int]:
+        match = re.search(r"episode_(\d+)$", file_path.stem)
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    def _episode_file_map(self, episode_files: list[Path]) -> dict[int, Path]:
+        mapped_files: dict[int, Path] = {}
+        for file_path in episode_files:
+            episode_index = self._episode_index_from_path(file_path)
+            if episode_index is not None:
+                mapped_files[episode_index] = file_path
+        return mapped_files
+
+    def _filter_episode_files_by_task_descriptions(
+        self,
+        episode_files: list[Path],
+    ) -> list[Path]:
+        if self._task_description_filter is None:
+            return episode_files
+
+        episodes_path = self.meta_root / "episodes.jsonl"
+        if episodes_path.exists():
+            episode_file_by_index = self._episode_file_map(episode_files)
+            filtered_episode_files: list[Path] = []
+            with episodes_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    episode_index = record.get("episode_index", None)
+                    if episode_index is None:
+                        continue
+                    file_path = episode_file_by_index.get(int(episode_index), None)
+                    if file_path is None:
+                        continue
+                    tasks = record.get("tasks", [])
+                    if isinstance(tasks, str):
+                        tasks = [tasks]
+                    normalized_tasks = {
+                        self._normalize_task_description(task) for task in tasks
+                    }
+                    if normalized_tasks & self._task_description_filter:
+                        filtered_episode_files.append(file_path)
+            return filtered_episode_files
+
+        filtered_episode_files = []
+        for file_path in episode_files:
+            try:
+                import pyarrow.parquet as pq
+
+                available_columns = set(
+                    pq.ParquetFile(file_path).schema_arrow.names
+                )
+                metadata_columns = [
+                    column
+                    for column in ("instruction", "task", "task_index")
+                    if column in available_columns
+                ]
+                df = pd.read_parquet(file_path, columns=metadata_columns)
+            except Exception:
+                df = pd.read_parquet(file_path)
+                metadata_columns = [
+                    column
+                    for column in ("instruction", "task", "task_index")
+                    if column in df.columns
+                ]
+                df = df[metadata_columns]
+            task_description = self._resolve_task_description(df)
+            if (
+                self._normalize_task_description(task_description)
+                in self._task_description_filter
+            ):
+                filtered_episode_files.append(file_path)
+        return filtered_episode_files
 
     def __len__(self) -> int:
         return len(self._episode_files)
@@ -310,6 +420,7 @@ class LiberoChunkTransitionDataset(Dataset):
         max_episodes: Optional[int] = None,
         returns_to_go_gamma: Optional[float] = None,
         episode_cache_size: int = 2,
+        task_descriptions: Optional[list[str]] = None,
     ) -> None:
         self.episode_dataset = LiberoChunkOfflineDataset(
             dataset_root=dataset_root,
@@ -320,6 +431,7 @@ class LiberoChunkTransitionDataset(Dataset):
             camera_name=camera_name,
             state_key=state_key,
             max_episodes=max_episodes,
+            task_descriptions=task_descriptions,
         )
         self.returns_to_go_gamma = returns_to_go_gamma
         self.episode_cache_size = max(1, int(episode_cache_size))
@@ -482,6 +594,53 @@ def libero_offline_transition_collate_fn(
     return collated
 
 
+def _cfg_get(container: Any, key: str, default: Any = None) -> Any:
+    if container is None:
+        return default
+    if hasattr(container, "get"):
+        return container.get(key, default)
+    return getattr(container, key, default)
+
+
+def resolve_libero_specific_reset_task_descriptions(cfg) -> Optional[list[str]]:
+    """Resolve offline task filtering from the LIBERO train specific reset id."""
+    dataset_cfg = cfg.algorithm.offline_rl.dataset
+    explicit_task_descriptions = _cfg_get(dataset_cfg, "task_descriptions", None)
+    if explicit_task_descriptions is not None:
+        return [str(task) for task in explicit_task_descriptions]
+
+    specific_reset_id = _cfg_get(cfg.env.train, "specific_reset_id", None)
+    if specific_reset_id is None:
+        return None
+
+    task_suite_name = _cfg_get(
+        cfg.env.train,
+        "task_suite_name",
+        _cfg_get(cfg.env.eval, "task_suite_name", None),
+    )
+    if task_suite_name is None:
+        raise ValueError(
+            "env.train.task_suite_name is required when env.train.specific_reset_id "
+            "is used for pure offline LIBERO task filtering."
+        )
+
+    from rlinf.envs.libero.utils import get_benchmark_overridden
+
+    task_suite = get_benchmark_overridden(task_suite_name)()
+    reset_state_id = int(specific_reset_id)
+    start_pivot = 0
+    for task_id in range(task_suite.get_num_tasks()):
+        end_pivot = start_pivot + len(task_suite.get_task_init_states(task_id))
+        if start_pivot <= reset_state_id < end_pivot:
+            return [str(task_suite.get_task(task_id).language)]
+        start_pivot = end_pivot
+
+    raise ValueError(
+        f"env.train.specific_reset_id={reset_state_id} is outside the valid "
+        f"reset-state range [0, {start_pivot}) for task suite {task_suite_name!r}."
+    )
+
+
 def build_libero_chunk_offline_dataset_from_cfg(cfg) -> LiberoChunkOfflineDataset:
     dataset_cfg = cfg.algorithm.offline_rl.dataset
     return LiberoChunkOfflineDataset(
@@ -493,6 +652,7 @@ def build_libero_chunk_offline_dataset_from_cfg(cfg) -> LiberoChunkOfflineDatase
         camera_name=str(dataset_cfg.get("camera_name", "image")),
         state_key=str(dataset_cfg.get("state_key", "state")),
         max_episodes=dataset_cfg.get("max_episodes", None),
+        task_descriptions=resolve_libero_specific_reset_task_descriptions(cfg),
     )
 
 
@@ -514,4 +674,5 @@ def build_libero_chunk_transition_dataset_from_cfg(cfg) -> LiberoChunkTransition
         max_episodes=dataset_cfg.get("max_episodes", None),
         returns_to_go_gamma=returns_to_go_gamma,
         episode_cache_size=int(dataset_cfg.get("episode_cache_size", 2)),
+        task_descriptions=resolve_libero_specific_reset_task_descriptions(cfg),
     )

@@ -26,12 +26,28 @@ from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
+def _sync_eval_specific_reset_id(cfg) -> None:
+    train_reset_id = cfg.env.train.get("specific_reset_id", None)
+    eval_reset_id = cfg.env.eval.get("specific_reset_id", None)
+    if train_reset_id is None:
+        return
+    if eval_reset_id is None:
+        cfg.env.eval.specific_reset_id = train_reset_id
+        return
+    if int(eval_reset_id) != int(train_reset_id):
+        raise ValueError(
+            "Offline RL single-reset training requires env.eval.specific_reset_id "
+            "to match env.train.specific_reset_id."
+        )
+
+
 @hydra.main(
     version_base="1.1",
     config_path="config",
     config_name="libero_cql_openvlaoft_adapter_offline",
 )
 def main(cfg) -> None:
+    _sync_eval_specific_reset_id(cfg)
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 

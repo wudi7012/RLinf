@@ -118,6 +118,7 @@ env:
     group_size: 1
     max_steps_per_rollout_epoch: 512
     max_episode_steps: 512
+    specific_reset_id: null  # set to an integer to train on one LIBERO reset state/task
     is_eval: False
     video_cfg:
       save_video: False
@@ -133,6 +134,7 @@ env:
     max_episode_steps: 512
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
+    specific_reset_id: null  # inherits env.train.specific_reset_id when train is set
     reset_gripper_open: False
     is_eval: True
     video_cfg:
