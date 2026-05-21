@@ -32,7 +32,7 @@ runner:
   save_interval: -1
 
   resume_dir: null
-  ckpt_path: null # /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260428-09:05:17-libero_calql_openvlaoft_adapter_offline/libero_calql_openvlaoft_adapter_offline/checkpoints/global_step_150/actor/model_state_dict/full_weights.pt
+  ckpt_path: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260520-08:21:56-libero_calql_openvlaoft_adapter_offline/libero_calql_openvlaoft_adapter_offline/checkpoints/global_step_250/actor/model_state_dict/full_weights.pt
 
 algorithm:
   update_epoch: 16

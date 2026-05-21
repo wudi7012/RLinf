@@ -1,0 +1,254 @@
+env:
+  train:
+    env_type: libero
+    task_suite_name: libero_130
+    total_num_envs: 64
+    auto_reset: true
+    ignore_terminations: true
+    max_steps_per_rollout_epoch: 64
+    max_episode_steps: 512
+    use_rel_reward: true
+    reward_coef: 1.0
+    reset_gripper_open: false
+    is_eval: false
+    seed: 0
+    group_size: 1
+    use_fixed_reset_state_ids: false
+    use_ordered_reset_state_ids: false
+    video_cfg:
+      save_video: false
+      info_on_video: false
+      video_base_dir: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260520-08:09:51-libero_sac_openvlaoft_adapter_online/video/train
+    init_params:
+      camera_heights: 256
+      camera_widths: 256
+    specific_reset_id: null
+  eval:
+    env_type: libero
+    task_suite_name: libero_130
+    total_num_envs: 32
+    auto_reset: true
+    ignore_terminations: true
+    max_steps_per_rollout_epoch: 512
+    max_episode_steps: 512
+    use_rel_reward: true
+    reward_coef: 1.0
+    reset_gripper_open: false
+    is_eval: true
+    seed: 0
+    group_size: 1
+    use_fixed_reset_state_ids: true
+    use_ordered_reset_state_ids: true
+    video_cfg:
+      save_video: false
+      info_on_video: false
+      video_base_dir: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260520-08:09:51-libero_sac_openvlaoft_adapter_online/video/eval
+    init_params:
+      camera_heights: 256
+      camera_widths: 256
+    specific_reset_id: null
+  group_name: EnvGroup
+actor:
+  model:
+    model_type: openvla_oft
+    implement_version: rlinf
+    model_path: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora
+    precision: bf16
+    value_type: action_level
+    action_dim: 7
+    num_action_chunks: 8
+    use_proprio: false
+    use_film: false
+    unnorm_key: libero_130_no_noops_trajall
+    center_crop: true
+    max_prompt_length: 128
+    vocab_size: 32000
+    hidden_size: 4096
+    add_value_head: false
+    image_size:
+    - 224
+    - 224
+    is_lora: false
+    lora_rank: 32
+    lora_path: null
+    num_images_in_input: 1
+    attn_implementation: flash_attention_2
+    low_cpu_mem_usage: true
+    trust_remote_code: true
+    policy_setup: widowx_bridge
+    proprio_dim: 8
+    adapter:
+      enable: true
+      type: residual_chunk_adapter
+      hidden_dim: 512
+      num_layers: 3
+      use_layernorm: true
+      residual_bound: 0.5
+      std_mode: global_learnable
+      init_log_std: -2.0
+      offline_rl_action_space: final
+      add_q_head: true
+      add_value_head: false
+      q_head_type: default
+      q_head_hidden_dims:
+      - 512
+      - 256
+      - 256
+      value_head_hidden_dims:
+      - 512
+      - 256
+    vla:
+      freeze_backbone: true
+      freeze_action_head: true
+      feature_type: pooled_last_hidden
+      use_base_action: true
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: full_shard
+    gradient_checkpointing: false
+    cpu_offload: false
+    offload_pin_memory: false
+    reshard_after_forward: true
+    enable_gradient_accumulation: true
+    forward_prefetch: false
+    limit_all_gathers: false
+    backward_prefetch: null
+    use_orig_params: true
+    use_liger_kernel: false
+    fsdp_size: -1
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: bf16
+      buffer_dtype: bf16
+    amp:
+      enabled: false
+      precision: bf16
+      use_grad_scaler: false
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 16
+  global_batch_size: 64
+  seed: 1234
+  enable_offload: false
+  optim:
+    lr: 2.0e-05
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 1.0
+    lr_scheduler: torch_constant
+  critic_optim:
+    lr: 0.0003
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 0.0
+    clip_grad: 10.0
+    lr_scheduler: torch_constant
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+runner:
+  task_type: embodied
+  logger:
+    log_path: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/RLinf/logs/20260520-08:09:51-libero_sac_openvlaoft_adapter_online
+    project_name: rlinf
+    experiment_name: libero_sac_openvlaoft_adapter_online
+    logger_backends:
+    - tensorboard
+  max_epochs: 10000
+  max_steps: -1
+  log_interval: 10
+  only_eval: false
+  val_check_interval: 200
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+  weight_sync_interval: 1
+algorithm:
+  update_epoch: 16
+  group_size: 1
+  agg_q: min
+  actor_agg_q: mean
+  backup_entropy: true
+  critic_subsample_size: 0
+  critic_actor_ratio: 1
+  target_update_type: q_head_only
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  adv_type: embodied_sac
+  loss_type: embodied_sac
+  loss_agg_func: token-mean
+  bootstrap_type: standard
+  gamma: 0.99
+  tau: 0.005
+  entropy_tuning:
+    alpha_type: softplus
+    initial_alpha: 0.01
+    target_entropy: -56
+    optim:
+      lr: 0.0001
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+  replay_buffer:
+    enable_cache: true
+    cache_size: 2000
+    sample_window_size: 2000
+    min_buffer_size: 64
+    auto_save: false
+  target_update_freq: 1
+  offline_rl:
+    name: sac
+    share_target_model: false
+  sampling_params:
+    do_sample: true
+    temperature_train: 1.6
+    temperature_eval: 1.6
+    top_k: -1
+    top_p: 1.0
+    repetition_penalty: 1.0
+  length_params:
+    max_new_token: null
+    max_length: 1024
+    min_length: 1
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: true
+  collect_prev_infos: false
+  model:
+    model_path: /inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora
+    precision: bf16
+reward:
+  use_reward_model: false
+critic:
+  use_critic_model: false
+adapter:
+  enable: true
+  type: residual_chunk_adapter
+  hidden_dim: 512
+  num_layers: 3
+  use_layernorm: true
+  residual_bound: 0.5
+  std_mode: global_learnable
+  init_log_std: -2.0
+  offline_rl_action_space: final
+  add_q_head: true
+  add_value_head: false
+  q_head_type: default
+  q_head_hidden_dims:
+  - 512
+  - 256
+  - 256
+  value_head_hidden_dims:
+  - 512
+  - 256
+vla:
+  freeze_backbone: true
+  freeze_action_head: true
+  feature_type: pooled_last_hidden
+  use_base_action: true
