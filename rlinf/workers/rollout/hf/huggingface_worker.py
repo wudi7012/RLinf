@@ -103,6 +103,7 @@ class MultiStepRolloutWorker(Worker):
         self.offline_data_iter = None
         self._offline_data_epoch = 0
         self._offline_data_iter_offset = 0
+        self._sync_load_log_count = 0
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -548,7 +549,7 @@ class MultiStepRolloutWorker(Worker):
             async_op=True,
             options=self._sync_weight_comm_options,
         ).async_wait()
-        self.hf_model.load_state_dict(param_state_dict)
+        self._load_synced_state_dict(param_state_dict)
         self.model_weights_id = (
             str(get_model_weights_id(self.hf_model)) + f"_{self.count_update}"
         )
@@ -556,6 +557,34 @@ class MultiStepRolloutWorker(Worker):
         del param_state_dict
         gc.collect()
         self.torch_platform.empty_cache()
+
+    def _load_synced_state_dict(self, param_state_dict: dict[str, torch.Tensor]) -> None:
+        if not self.cfg.rollout.get("sync_trainable_only", False):
+            self.hf_model.load_state_dict(param_state_dict)
+            return
+
+        incompatible = self.hf_model.load_state_dict(param_state_dict, strict=False)
+        unexpected = set(incompatible.unexpected_keys)
+        matched_keys = [key for key in param_state_dict if key not in unexpected]
+        if not matched_keys:
+            sample_keys = list(param_state_dict.keys())[:8]
+            raise RuntimeError(
+                "rollout.sync_trainable_only=True but none of the received "
+                f"parameters matched the rollout model. Sample keys: {sample_keys}"
+            )
+
+        if unexpected:
+            self.log_warning(
+                "Partial rollout sync had unmatched parameters: "
+                f"matched={len(matched_keys)} unexpected={len(unexpected)} "
+                f"sample_unexpected={list(unexpected)[:8]}"
+            )
+        elif self._sync_load_log_count < 3:
+            self.log_info(
+                "Partial rollout sync loaded trainable parameters: "
+                f"matched={len(matched_keys)} received={len(param_state_dict)}"
+            )
+            self._sync_load_log_count += 1
 
     async def send_rollout_trajectories(
         self, rollout_result: EmbodiedRolloutResult, channel: Channel

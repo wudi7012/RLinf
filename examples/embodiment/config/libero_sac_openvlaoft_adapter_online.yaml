@@ -134,6 +134,8 @@ rollout:
   pipeline_stage_num: 1
   collect_transitions: True
   collect_prev_infos: False
+  sync_trainable_only: True
+  sync_param_keywords: ["adapter_actor", "q_head", "value_head"]
 
   model:
     model_path: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/model/Rlinf-OpenVLAOFT-LIBERO-130-Base-Lora"

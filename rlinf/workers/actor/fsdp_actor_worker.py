@@ -999,6 +999,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._sync_weight_comm_options = CollectiveGroupOptions(
             accel_max_ctas=max_ctas, accel_min_ctas=min_ctas
         )
+        self._rollout_sync_log_count = 0
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
@@ -1048,7 +1049,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
     def sync_model_to_rollout(self) -> None:
         """
-        Sync the model's full state dict to the rollout worker.
+        Sync model parameters to the rollout worker.
         """
         if self.enable_offload and not self.is_optimizer_offloaded:
             self.offload_optimizer()
@@ -1057,6 +1058,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_param_and_grad(self.device)
 
         state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
+        state_dict = self._filter_rollout_state_dict(state_dict)
         for rank in self._weight_dst_rank_in_rollout:
             self.send(
                 state_dict,
@@ -1067,6 +1069,40 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
         if self.enable_offload and not self.is_weight_offloaded:
             self.offload_param_and_grad()
+
+    def _filter_rollout_state_dict(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        if not self.cfg.rollout.get("sync_trainable_only", False):
+            return state_dict
+
+        keywords = list(self.cfg.rollout.get("sync_param_keywords", []))
+        if not keywords:
+            raise ValueError(
+                "rollout.sync_trainable_only=True requires "
+                "rollout.sync_param_keywords to be non-empty."
+            )
+
+        filtered = {
+            key: value
+            for key, value in state_dict.items()
+            if any(keyword in key for keyword in keywords)
+        }
+        if not filtered:
+            sample_keys = list(state_dict.keys())[:8]
+            raise RuntimeError(
+                "rollout.sync_trainable_only=True but no rollout parameters matched "
+                f"sync_param_keywords={keywords}. Sample state_dict keys: {sample_keys}"
+            )
+
+        if self._rollout_sync_log_count < 3:
+            self.log_info(
+                "Syncing partial rollout state_dict: "
+                f"{len(filtered)}/{len(state_dict)} tensors matched "
+                f"sync_param_keywords={keywords}"
+            )
+            self._rollout_sync_log_count += 1
+        return filtered
 
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
         """
