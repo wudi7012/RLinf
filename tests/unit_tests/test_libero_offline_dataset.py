@@ -2,10 +2,15 @@ import json
 
 import numpy as np
 import pandas as pd
+import torch
+from omegaconf import OmegaConf
 
 from rlinf.data.datasets.libero_offline_rl import (
     LiberoChunkOfflineDataset,
     LiberoChunkTransitionDataset,
+    LiberoPreprocessedTransitionDataset,
+    build_libero_chunk_transition_dataset_from_cfg,
+    libero_offline_transition_collate_fn,
 )
 
 
@@ -68,3 +73,75 @@ def test_libero_offline_dataset_filters_episodes_by_task_description(tmp_path):
     ]
     assert len(episode_dataset) == 2
     assert len(transition_dataset) == 6
+
+
+def test_libero_preprocessed_dataset_loads_sidecars(tmp_path):
+    preprocessed_root = tmp_path / "dataset/preprocessed"
+    episode_dir = preprocessed_root / "chunk-000"
+    episode_dir.mkdir(parents=True)
+    payload = {
+        "episode_index": 0,
+        "curr_obs": {
+            "features": torch.arange(6, dtype=torch.float32).view(3, 2),
+            "base_actions": torch.zeros(3, 2, 7),
+        },
+        "next_obs": {
+            "features": torch.arange(6, 12, dtype=torch.float32).view(3, 2),
+            "base_actions": torch.ones(3, 2, 7),
+        },
+        "actions": torch.zeros(3, 14),
+        "rewards": torch.zeros(3, 1),
+        "terminations": torch.zeros(3, 1, dtype=torch.bool),
+        "truncations": torch.zeros(3, 1, dtype=torch.bool),
+        "dones": torch.zeros(3, 1, dtype=torch.bool),
+    }
+    torch.save(payload, episode_dir / "episode_000000.pt")
+    _write_jsonl(
+        preprocessed_root / "index.jsonl",
+        [{"episode_index": 0, "path": "chunk-000/episode_000000.pt"}],
+    )
+
+    dataset = LiberoPreprocessedTransitionDataset(str(preprocessed_root))
+    batch = libero_offline_transition_collate_fn([dataset[0], dataset[1]])
+
+    assert len(dataset) == 3
+    assert batch["curr_obs"]["features"].shape == (2, 2)
+    assert batch["next_obs"]["base_actions"].shape == (2, 2, 7)
+    assert batch["actions"].shape == (2, 14)
+
+
+def test_libero_transition_builder_uses_preprocessed_auto(tmp_path):
+    dataset_root = tmp_path / "dataset"
+    preprocessed_root = dataset_root / "preprocessed/chunk-000"
+    preprocessed_root.mkdir(parents=True)
+    torch.save(
+        {
+            "curr_obs": {"features": torch.zeros(1, 2)},
+            "next_obs": {"features": torch.ones(1, 2)},
+            "actions": torch.zeros(1, 14),
+            "rewards": torch.zeros(1, 1),
+            "terminations": torch.zeros(1, 1, dtype=torch.bool),
+            "truncations": torch.zeros(1, 1, dtype=torch.bool),
+            "dones": torch.zeros(1, 1, dtype=torch.bool),
+        },
+        preprocessed_root / "episode_000000.pt",
+    )
+    cfg = OmegaConf.create(
+        {
+            "actor": {"model": {"num_action_chunks": 2}},
+            "algorithm": {
+                "offline_rl": {
+                    "name": "cql",
+                    "dataset": {
+                        "dataset_root": str(dataset_root),
+                        "use_preprocessed": "auto",
+                    },
+                }
+            },
+        }
+    )
+
+    dataset = build_libero_chunk_transition_dataset_from_cfg(cfg)
+
+    assert isinstance(dataset, LiberoPreprocessedTransitionDataset)
+    assert len(dataset) == 1

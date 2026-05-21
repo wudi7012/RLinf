@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import defaultdict
 from typing import Any, Literal
 
@@ -137,9 +138,10 @@ class EnvWorker(Worker):
             ):
                 from rlinf.envs.wrappers import CollectEpisode
 
+                save_dir = self._resolve_data_collection_save_dir(env_cfg, stage_id)
                 env = CollectEpisode(
                     env,
-                    save_dir=env_cfg.data_collection.save_dir,
+                    save_dir=save_dir,
                     rank=self._rank,
                     num_envs=num_envs_per_stage,
                     export_format=getattr(
@@ -159,6 +161,22 @@ class EnvWorker(Worker):
                 )
             env_list.append(env)
         return env_list
+
+    def _resolve_data_collection_save_dir(self, env_cfg, stage_id: int) -> str:
+        save_dir = str(env_cfg.data_collection.save_dir)
+        if not bool(getattr(env_cfg.data_collection, "shard_per_worker", False)):
+            return save_dir
+        shard_name = f"collected_data_stage{stage_id}_rank{self._rank}"
+        return os.path.join(save_dir, shard_name)
+
+    def finalize_data_collection(self):
+        """Finalize data-collection wrappers so metadata is written before merge."""
+        finalized = []
+        for env in [*self.env_list, *self.eval_env_list]:
+            if hasattr(env, "close"):
+                env.close()
+                finalized.append(getattr(env, "save_dir", None))
+        return {"rank": self._rank, "finalized": finalized}
 
     def _setup_dst_ranks(self, batch_size: int) -> list[tuple[int, int]]:
         """Compute rollout peer ranks for this env worker.

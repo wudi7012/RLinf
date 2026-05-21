@@ -542,6 +542,128 @@ class LiberoChunkTransitionDataset(Dataset):
         )
 
 
+class LiberoPreprocessedTransitionDataset(Dataset):
+    """Transition dataset backed by pre-materialized model-ready sidecars.
+
+    The sidecar format is intentionally separate from the LeRobot ``data/`` tree:
+    raw episodes remain compatible with existing LIBERO offline datasets, while
+    ``preprocessed/`` can be regenerated for a particular model/preprocessing setup.
+    """
+
+    def __init__(
+        self,
+        preprocessed_root: str,
+        max_episodes: Optional[int] = None,
+        episode_cache_size: int = 2,
+    ) -> None:
+        self.preprocessed_root = Path(preprocessed_root).expanduser().resolve()
+        self.episode_cache_size = max(1, int(episode_cache_size))
+        self._indexed_num_transitions: dict[Path, int] = {}
+        self._episode_files = self._discover_episode_files()
+        if max_episodes is not None:
+            self._episode_files = self._episode_files[: int(max_episodes)]
+        if not self._episode_files:
+            raise FileNotFoundError(
+                f"No preprocessed transition sidecars found under "
+                f"'{self.preprocessed_root}'."
+            )
+        self._episode_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._transition_index: list[tuple[int, int]] = []
+        self._build_transition_index()
+
+    def _discover_episode_files(self) -> list[Path]:
+        index_path = self.preprocessed_root / "index.jsonl"
+        if index_path.exists():
+            episode_files: list[Path] = []
+            with index_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    rel_path = record.get("path", None)
+                    if rel_path is None:
+                        continue
+                    file_path = self.preprocessed_root / str(rel_path)
+                    episode_files.append(file_path)
+                    num_transitions = record.get("num_transitions", None)
+                    if num_transitions is not None:
+                        self._indexed_num_transitions[file_path] = int(
+                            num_transitions
+                        )
+            return [path for path in episode_files if path.exists()]
+        return sorted(self.preprocessed_root.glob("**/episode_*.pt"))
+
+    @staticmethod
+    def _torch_load(path: Path) -> dict[str, Any]:
+        try:
+            return torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+
+    def _get_num_transitions(self, file_path: Path) -> int:
+        indexed_num_transitions = self._indexed_num_transitions.get(file_path, None)
+        if indexed_num_transitions is not None:
+            return indexed_num_transitions
+        payload = self._torch_load(file_path)
+        return int(payload["actions"].shape[0])
+
+    def _build_transition_index(self) -> None:
+        for episode_offset, file_path in enumerate(self._episode_files):
+            for transition_idx in range(self._get_num_transitions(file_path)):
+                self._transition_index.append((episode_offset, transition_idx))
+
+    def __len__(self) -> int:
+        return len(self._transition_index)
+
+    def _get_cached_episode(self, episode_offset: int) -> dict[str, Any]:
+        cached = self._episode_cache.get(episode_offset, None)
+        if cached is not None:
+            self._episode_cache.move_to_end(episode_offset)
+            return cached
+
+        payload = self._torch_load(self._episode_files[episode_offset])
+        self._episode_cache[episode_offset] = payload
+        self._episode_cache.move_to_end(episode_offset)
+        while len(self._episode_cache) > self.episode_cache_size:
+            self._episode_cache.popitem(last=False)
+        return payload
+
+    def _slice_value(self, value: Any, transition_idx: int) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value[transition_idx].clone()
+        if isinstance(value, dict):
+            return {
+                key: self._slice_value(sub_value, transition_idx)
+                for key, sub_value in value.items()
+            }
+        if isinstance(value, list):
+            return value[transition_idx]
+        return value
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        episode_offset, transition_idx = self._transition_index[index]
+        episode = self._get_cached_episode(episode_offset)
+        transition = {
+            "curr_obs": self._slice_value(episode["curr_obs"], transition_idx),
+            "next_obs": self._slice_value(episode["next_obs"], transition_idx),
+            "actions": episode["actions"][transition_idx].clone(),
+            "rewards": episode["rewards"][transition_idx].clone(),
+            "terminations": episode["terminations"][transition_idx].clone(),
+            "truncations": episode["truncations"][transition_idx].clone(),
+            "dones": episode["dones"][transition_idx].clone(),
+        }
+        if "returns_to_go" in episode:
+            transition["returns_to_go"] = episode["returns_to_go"][
+                transition_idx
+            ].clone()
+        if "next_returns_to_go" in episode:
+            transition["next_returns_to_go"] = episode["next_returns_to_go"][
+                transition_idx
+            ].clone()
+        return transition
+
+
 def _collate_env_obs_batch(env_obs_batch: list[dict[str, Any]]) -> dict[str, Any]:
     collated: dict[str, Any] = {}
     keys = env_obs_batch[0].keys()
@@ -563,9 +685,61 @@ def _collate_env_obs_batch(env_obs_batch: list[dict[str, Any]]) -> dict[str, Any
     return collated
 
 
+def _collate_nested_batch(values: list[Any]) -> Any:
+    first_value = values[0]
+    if isinstance(first_value, torch.Tensor):
+        return torch.stack(values, dim=0)
+    if isinstance(first_value, dict):
+        return {
+            key: _collate_nested_batch([value[key] for value in values])
+            for key in first_value
+        }
+    if isinstance(first_value, str):
+        return list(values)
+    if first_value is None:
+        if not all(value is None for value in values):
+            raise ValueError("Mixed None / non-None values in preprocessed batch.")
+        return None
+    return list(values)
+
+
 def libero_offline_transition_collate_fn(
-    batch: list[LiberoOfflineTransition],
+    batch: list[LiberoOfflineTransition | dict[str, Any]],
 ) -> dict[str, Any]:
+    if isinstance(batch[0], dict):
+        collated = {
+            "curr_obs": _collate_nested_batch(
+                [transition["curr_obs"] for transition in batch]
+            ),
+            "next_obs": _collate_nested_batch(
+                [transition["next_obs"] for transition in batch]
+            ),
+            "actions": torch.stack(
+                [transition["actions"] for transition in batch], dim=0
+            ),
+            "rewards": torch.stack(
+                [transition["rewards"] for transition in batch], dim=0
+            ),
+            "terminations": torch.stack(
+                [transition["terminations"] for transition in batch], dim=0
+            ),
+            "truncations": torch.stack(
+                [transition["truncations"] for transition in batch], dim=0
+            ),
+            "dones": torch.stack(
+                [transition["dones"] for transition in batch], dim=0
+            ),
+        }
+        if "returns_to_go" in batch[0]:
+            collated["returns_to_go"] = torch.stack(
+                [transition["returns_to_go"] for transition in batch], dim=0
+            )
+        if "next_returns_to_go" in batch[0]:
+            collated["next_returns_to_go"] = torch.stack(
+                [transition["next_returns_to_go"] for transition in batch], dim=0
+            )
+        return collated
+
     collated = {
         "curr_env_obs": _collate_env_obs_batch(
             [transition.curr_env_obs for transition in batch]
@@ -592,6 +766,53 @@ def libero_offline_transition_collate_fn(
             [transition.next_returns_to_go for transition in batch], dim=0
         )
     return collated
+
+
+def default_libero_preprocessed_root(dataset_root: str | Path) -> Path:
+    dataset_root = Path(dataset_root).expanduser().resolve()
+    if dataset_root.name == "data" and (dataset_root.parent / "meta").is_dir():
+        return dataset_root.parent / "preprocessed"
+    return dataset_root / "preprocessed"
+
+
+def _has_preprocessed_sidecars(preprocessed_root: str | Path) -> bool:
+    root = Path(preprocessed_root).expanduser().resolve()
+    if not root.exists():
+        return False
+    index_path = root / "index.jsonl"
+    if index_path.exists() and index_path.stat().st_size > 0:
+        return True
+    return any(root.glob("**/episode_*.pt"))
+
+
+def _resolve_preprocessed_root(dataset_cfg) -> Path:
+    preprocessed_root = dataset_cfg.get("preprocessed_root", None)
+    if preprocessed_root is None:
+        preprocessed_root = default_libero_preprocessed_root(dataset_cfg.dataset_root)
+    return Path(preprocessed_root).expanduser().resolve()
+
+
+def _should_use_preprocessed_dataset(dataset_cfg, preprocessed_root: Path) -> bool:
+    mode = dataset_cfg.get("use_preprocessed", "auto")
+    if isinstance(mode, str):
+        mode = mode.lower()
+    if mode in (False, "false", "never", "off", "raw"):
+        return False
+
+    has_sidecars = _has_preprocessed_sidecars(preprocessed_root)
+    if mode in (True, "true", "always", "on"):
+        if not has_sidecars:
+            raise FileNotFoundError(
+                f"algorithm.offline_rl.dataset.use_preprocessed=true but no "
+                f"sidecars were found under '{preprocessed_root}'."
+            )
+        return True
+    if mode in ("auto", None):
+        return has_sidecars
+    raise ValueError(
+        "algorithm.offline_rl.dataset.use_preprocessed must be one of "
+        "auto/true/false."
+    )
 
 
 def _cfg_get(container: Any, key: str, default: Any = None) -> Any:
@@ -658,6 +879,14 @@ def build_libero_chunk_offline_dataset_from_cfg(cfg) -> LiberoChunkOfflineDatase
 
 def build_libero_chunk_transition_dataset_from_cfg(cfg) -> LiberoChunkTransitionDataset:
     dataset_cfg = cfg.algorithm.offline_rl.dataset
+    preprocessed_root = _resolve_preprocessed_root(dataset_cfg)
+    if _should_use_preprocessed_dataset(dataset_cfg, preprocessed_root):
+        return LiberoPreprocessedTransitionDataset(
+            preprocessed_root=str(preprocessed_root),
+            max_episodes=dataset_cfg.get("max_episodes", None),
+            episode_cache_size=int(dataset_cfg.get("episode_cache_size", 2)),
+        )
+
     returns_to_go_gamma = None
     if cfg.algorithm.offline_rl.get("name", "sac").lower() == "calql":
         returns_to_go_gamma = cfg.algorithm.offline_rl.get("calql", {}).get(

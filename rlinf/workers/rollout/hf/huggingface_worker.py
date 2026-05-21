@@ -14,6 +14,8 @@
 
 import copy
 import gc
+import json
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -26,6 +28,10 @@ from tqdm import tqdm
 from rlinf.algorithms.offline_rl import is_pure_offline_dataset_enabled
 from rlinf.config import SupportedModel
 from rlinf.data.datasets.libero_offline_rl import (
+    LiberoChunkOfflineDataset,
+    _compute_returns_to_go,
+    default_libero_preprocessed_root,
+    resolve_libero_specific_reset_task_descriptions,
     build_libero_chunk_transition_dataset_from_cfg,
     libero_offline_transition_collate_fn,
 )
@@ -541,10 +547,106 @@ class MultiStepRolloutWorker(Worker):
             for key, value in transition_obs.items()
         }
 
+    def _nested_to_cpu(self, value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().contiguous()
+        if isinstance(value, dict):
+            return {
+                key: self._nested_to_cpu(sub_value)
+                for key, sub_value in value.items()
+            }
+        if isinstance(value, list):
+            return [self._nested_to_cpu(sub_value) for sub_value in value]
+        return value
+
+    def _slice_batched_value(self, value: Any, begin: int, end: int) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value[begin:end]
+        if isinstance(value, dict):
+            return {
+                key: self._slice_batched_value(sub_value, begin, end)
+                for key, sub_value in value.items()
+            }
+        if isinstance(value, list):
+            return value[begin:end]
+        return value
+
+    def _concat_nested_values(self, values: list[Any]) -> Any:
+        first_value = values[0]
+        if isinstance(first_value, torch.Tensor):
+            return torch.cat(values, dim=0).contiguous()
+        if isinstance(first_value, dict):
+            return {
+                key: self._concat_nested_values([value[key] for value in values])
+                for key in first_value
+            }
+        if isinstance(first_value, list):
+            merged = []
+            for value in values:
+                merged.extend(value)
+            return merged
+        return values
+
+    def _prepare_policy_actions(
+        self,
+        actions: torch.Tensor,
+        curr_transition_obs: dict[str, Any],
+    ) -> torch.Tensor:
+        actions = actions.to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        if hasattr(self.hf_model, "_delta_to_policy_action"):
+            base_actions = curr_transition_obs["base_actions"].to(
+                device=self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+            base_flat = base_actions.flatten(start_dim=1).to(dtype=actions.dtype)
+            delta_actions = actions.view(actions.shape[0], -1) - base_flat
+            actions = self.hf_model._delta_to_policy_action(
+                delta_actions,
+                base_actions,
+            ).to(dtype=torch.float32)
+        return actions
+
     def _prepare_pure_offline_batch(
         self,
         raw_batch: dict[str, Any],
     ) -> dict[str, Any]:
+        if "curr_obs" in raw_batch and "next_obs" in raw_batch:
+            batch = {
+                "curr_obs": self._nested_to_cpu(raw_batch["curr_obs"]),
+                "next_obs": self._nested_to_cpu(raw_batch["next_obs"]),
+                "actions": raw_batch["actions"]
+                .to(dtype=torch.float32)
+                .cpu()
+                .contiguous(),
+                "rewards": raw_batch["rewards"]
+                .to(dtype=torch.float32)
+                .cpu()
+                .contiguous(),
+                "terminations": raw_batch["terminations"].cpu().contiguous(),
+                "truncations": raw_batch["truncations"].cpu().contiguous(),
+                "dones": raw_batch["dones"].cpu().contiguous(),
+            }
+            if "returns_to_go" in raw_batch:
+                batch["returns_to_go"] = (
+                    raw_batch["returns_to_go"]
+                    .to(dtype=torch.float32)
+                    .cpu()
+                    .contiguous()
+                )
+            if "next_returns_to_go" in raw_batch:
+                batch["next_returns_to_go"] = (
+                    raw_batch["next_returns_to_go"]
+                    .to(dtype=torch.float32)
+                    .cpu()
+                    .contiguous()
+                )
+            return batch
+
         transition_kwargs = self._build_pure_offline_transition_kwargs()
         with torch.no_grad():
             curr_transition_obs = self.hf_model.build_transition_obs(
@@ -556,26 +658,19 @@ class MultiStepRolloutWorker(Worker):
                 **transition_kwargs,
             )
 
-        actions = raw_batch["actions"].to(
-            device=self.device,
-            dtype=torch.float32,
-            non_blocking=True,
+        actions = self._prepare_policy_actions(
+            raw_batch["actions"],
+            curr_transition_obs,
         )
-        if hasattr(self.hf_model, "_delta_to_policy_action"):
-            base_flat = curr_transition_obs["base_actions"].flatten(start_dim=1).to(
-                dtype=actions.dtype
-            )
-            delta_actions = actions.view(actions.shape[0], -1) - base_flat
-            actions = self.hf_model._delta_to_policy_action(
-                delta_actions,
-                curr_transition_obs["base_actions"],
-            ).to(dtype=torch.float32)
 
         batch = {
             "curr_obs": self._transition_obs_to_cpu(curr_transition_obs),
             "next_obs": self._transition_obs_to_cpu(next_transition_obs),
             "actions": actions.detach().cpu().contiguous(),
-            "rewards": raw_batch["rewards"].to(dtype=torch.float32).cpu().contiguous(),
+            "rewards": raw_batch["rewards"]
+            .to(dtype=torch.float32)
+            .cpu()
+            .contiguous(),
             "terminations": raw_batch["terminations"].cpu().contiguous(),
             "truncations": raw_batch["truncations"].cpu().contiguous(),
             "dones": raw_batch["dones"].cpu().contiguous(),
@@ -595,6 +690,172 @@ class MultiStepRolloutWorker(Worker):
                 .contiguous()
             )
         return batch
+
+    def _build_raw_offline_episode_dataset(
+        self,
+        dataset_root: str | None = None,
+    ) -> LiberoChunkOfflineDataset:
+        dataset_cfg = self._pure_offline_dataset_cfg()
+        task_descriptions = None
+        if dataset_root is None:
+            task_descriptions = resolve_libero_specific_reset_task_descriptions(self.cfg)
+            dataset_root = str(dataset_cfg.dataset_root)
+        return LiberoChunkOfflineDataset(
+            dataset_root=str(dataset_root),
+            chunk_size=int(
+                dataset_cfg.get("chunk_size", self.cfg.actor.model.num_action_chunks)
+            ),
+            sample_stride=int(dataset_cfg.get("sample_stride", 1)),
+            terminal_reward=float(dataset_cfg.get("terminal_reward", 1.0)),
+            intermediate_reward=float(dataset_cfg.get("intermediate_reward", 0.0)),
+            camera_name=str(dataset_cfg.get("camera_name", "image")),
+            state_key=str(dataset_cfg.get("state_key", "state")),
+            max_episodes=dataset_cfg.get("max_episodes", None),
+            task_descriptions=task_descriptions,
+        )
+
+    @Worker.timer("materialize_pure_offline_dataset")
+    def materialize_pure_offline_dataset(
+        self,
+        dataset_root: str | None = None,
+        output_root: str | None = None,
+        batch_size: int | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        if self._rank != 0:
+            return {"rank": self._rank, "skipped": True}
+
+        dataset_cfg = self._pure_offline_dataset_cfg()
+        if dataset_root is None:
+            dataset_root = str(dataset_cfg.dataset_root)
+        if output_root is None:
+            output_root = dataset_cfg.get("preprocessed_root", None)
+            if output_root is None:
+                output_root = str(default_libero_preprocessed_root(dataset_root))
+
+        output_path = Path(output_root).expanduser().resolve()
+        if output_path.exists() and any(output_path.glob("**/episode_*.pt")):
+            if not overwrite:
+                raise FileExistsError(
+                    f"Preprocessed sidecars already exist under '{output_path}'. "
+                    "Set overwrite=true or choose a new output_root."
+                )
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        if self.enable_offload:
+            self.reload_model()
+        self.hf_model.eval()
+
+        episode_dataset = self._build_raw_offline_episode_dataset(dataset_root)
+        materialize_batch_size = int(
+            batch_size or dataset_cfg.get("preprocess_batch_size", 32)
+        )
+        index_records: list[dict[str, Any]] = []
+        total_transitions = 0
+        transition_kwargs = self._build_pure_offline_transition_kwargs()
+
+        for episode_offset in range(len(episode_dataset)):
+            episode = episode_dataset.load_episode(episode_offset)
+            if episode is None:
+                continue
+
+            curr_obs_parts: list[dict[str, Any]] = []
+            next_obs_parts: list[dict[str, Any]] = []
+            action_parts: list[torch.Tensor] = []
+            num_transitions = int(episode.actions.shape[0])
+
+            for begin in range(0, num_transitions, materialize_batch_size):
+                end = min(begin + materialize_batch_size, num_transitions)
+                curr_env_obs = self._slice_batched_value(
+                    episode.curr_env_obs,
+                    begin,
+                    end,
+                )
+                next_env_obs = self._slice_batched_value(
+                    episode.next_env_obs,
+                    begin,
+                    end,
+                )
+                with torch.no_grad():
+                    curr_transition_obs = self.hf_model.build_transition_obs(
+                        env_obs=curr_env_obs,
+                        **transition_kwargs,
+                    )
+                    next_transition_obs = self.hf_model.build_transition_obs(
+                        env_obs=next_env_obs,
+                        **transition_kwargs,
+                    )
+                    policy_actions = self._prepare_policy_actions(
+                        episode.actions[begin:end],
+                        curr_transition_obs,
+                    )
+
+                curr_obs_parts.append(self._nested_to_cpu(curr_transition_obs))
+                next_obs_parts.append(self._nested_to_cpu(next_transition_obs))
+                action_parts.append(policy_actions.detach().cpu().contiguous())
+
+            chunk_idx = int(episode.episode_index) // 1000
+            rel_dir = Path(f"chunk-{chunk_idx:03d}")
+            episode_dir = output_path / rel_dir
+            episode_dir.mkdir(parents=True, exist_ok=True)
+            rel_path = rel_dir / f"episode_{int(episode.episode_index):06d}.pt"
+
+            payload = {
+                "episode_index": int(episode.episode_index),
+                "curr_obs": self._concat_nested_values(curr_obs_parts),
+                "next_obs": self._concat_nested_values(next_obs_parts),
+                "actions": torch.cat(action_parts, dim=0).contiguous(),
+                "rewards": episode.rewards.cpu().contiguous(),
+                "terminations": episode.terminations.cpu().contiguous(),
+                "truncations": episode.truncations.cpu().contiguous(),
+                "dones": episode.dones.cpu().contiguous(),
+                "metadata": {
+                    "chunk_size": int(episode_dataset.chunk_size),
+                    "sample_stride": int(episode_dataset.sample_stride),
+                    "model_type": str(self.cfg.actor.model.model_type),
+                },
+            }
+            if self.cfg.algorithm.offline_rl.get("name", "sac").lower() == "calql":
+                returns_to_go = _compute_returns_to_go(
+                    rewards=episode.rewards,
+                    dones=episode.dones,
+                    gamma=float(
+                        self.cfg.algorithm.offline_rl.get("calql", {}).get(
+                            "returns_to_go_gamma", 1.0
+                        )
+                    ),
+                )
+                payload["returns_to_go"] = returns_to_go.cpu().contiguous()
+                payload["next_returns_to_go"] = torch.cat(
+                    [
+                        returns_to_go[1:],
+                        torch.zeros_like(returns_to_go[:1]),
+                    ],
+                    dim=0,
+                ).cpu().contiguous()
+            torch.save(payload, output_path / rel_path)
+            index_records.append(
+                {
+                    "episode_index": int(episode.episode_index),
+                    "path": rel_path.as_posix(),
+                    "num_transitions": num_transitions,
+                }
+            )
+            total_transitions += num_transitions
+
+        with (output_path / "index.jsonl").open("w", encoding="utf-8") as f:
+            for record in index_records:
+                f.write(json.dumps(record) + "\n")
+
+        if self.enable_offload:
+            self.offload_model()
+
+        return {
+            "rank": self._rank,
+            "preprocessed_root": str(output_path),
+            "episodes": len(index_records),
+            "transitions": total_transitions,
+        }
 
     def prepare_pure_offline_train_batches(self, num_batches: int) -> list[dict[str, Any]]:
         if not self.use_pure_offline_dataset:

@@ -78,6 +78,8 @@ algorithm:
     dataset:
       enable: true
       dataset_root: "/inspire/hdd/project/chemicalreaction/zhutong-24049/wudi/dataset/pi_libero/data"
+      use_preprocessed: auto
+      preprocessed_root: null
       chunk_size: ${actor.model.num_action_chunks}
       sample_stride: 1
       terminal_reward: 1.0
