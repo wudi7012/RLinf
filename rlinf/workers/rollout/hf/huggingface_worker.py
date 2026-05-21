@@ -338,6 +338,87 @@ class MultiStepRolloutWorker(Worker):
         env_obs.pop("task_descriptions", None)
         return env_obs
 
+    @staticmethod
+    def _done_env_mask(dones: torch.Tensor | None) -> torch.Tensor | None:
+        if dones is None:
+            return None
+        dones = dones.bool()
+        if dones.ndim == 1:
+            return dones
+        reduce_dims = tuple(range(1, dones.ndim))
+        return dones.any(dim=reduce_dims)
+
+    @staticmethod
+    def _slice_obs_batch(obs: dict[str, Any], mask: torch.Tensor) -> dict[str, Any]:
+        sliced_obs: dict[str, Any] = {}
+        mask_cpu = mask.cpu()
+        mask_list = mask_cpu.tolist()
+        batch_size = int(mask_cpu.shape[0])
+        for key, value in obs.items():
+            if isinstance(value, torch.Tensor) and value.shape[:1] == (batch_size,):
+                sliced_obs[key] = value[mask_cpu]
+            elif isinstance(value, np.ndarray) and value.shape[:1] == (batch_size,):
+                sliced_obs[key] = value[mask_cpu.numpy()]
+            elif isinstance(value, list) and len(value) == batch_size:
+                sliced_obs[key] = [
+                    item for item, keep in zip(value, mask_list) if keep
+                ]
+            else:
+                sliced_obs[key] = value
+        return sliced_obs
+
+    @staticmethod
+    def _merge_transition_obs_by_mask(
+        base_obs: dict[str, Any],
+        replacement_obs: dict[str, Any],
+        mask: torch.Tensor,
+    ) -> dict[str, Any]:
+        merged_obs = dict(base_obs)
+        for key, replacement_value in replacement_obs.items():
+            base_value = base_obs.get(key)
+            if not isinstance(base_value, torch.Tensor) or not isinstance(
+                replacement_value, torch.Tensor
+            ):
+                merged_obs[key] = replacement_value
+                continue
+
+            mask_on_device = mask.to(device=base_value.device)
+            value = base_value.clone()
+            value[mask_on_device] = replacement_value.to(
+                device=base_value.device,
+                dtype=base_value.dtype,
+            )
+            merged_obs[key] = value
+        return merged_obs
+
+    def _prepare_next_transition_obs(
+        self,
+        *,
+        env_output: dict[str, Any],
+        current_transition_obs: dict[str, Any],
+        mode: Literal["train", "eval"] = "train",
+    ) -> dict[str, Any]:
+        done_mask = self._done_env_mask(env_output.get("dones"))
+        final_obs = env_output.get("final_obs")
+        if (
+            final_obs is None
+            or done_mask is None
+            or not bool(done_mask.any())
+            or not self.cfg.env.train.auto_reset
+        ):
+            return current_transition_obs
+
+        final_obs_subset = self._slice_obs_batch(final_obs, done_mask)
+        final_transition_obs = self._prepare_transition_obs_from_env(
+            final_obs_subset,
+            mode=mode,
+        )
+        return self._merge_transition_obs_by_mask(
+            current_transition_obs,
+            final_transition_obs,
+            done_mask,
+        )
+
     def _pure_offline_dataset_cfg(self):
         return self.cfg.algorithm.offline_rl.dataset
 
@@ -619,15 +700,11 @@ class MultiStepRolloutWorker(Worker):
                         mode="train",
                     )
 
-                next_obs_env = (
-                    env_output["final_obs"]
-                    if dones.any() and self.cfg.env.train.auto_reset
-                    else env_output["obs"]
-                )
                 next_transition_obs = None
                 if self.collect_transitions and last_transition_obs[stage_id] is not None:
-                    next_transition_obs = self._prepare_transition_obs_from_env(
-                        next_obs_env,
+                    next_transition_obs = self._prepare_next_transition_obs(
+                        env_output=env_output,
+                        current_transition_obs=current_transition_obs,
                         mode="train",
                     )
 
@@ -675,7 +752,10 @@ class MultiStepRolloutWorker(Worker):
 
             dones, rewards = self.get_dones_and_rewards(env_output)
 
-            _, result = self.predict(env_output["obs"])
+            prev_values = None
+            if self.collect_prev_infos:
+                _, result = self.predict(env_output["obs"])
+                prev_values = result["prev_values"]
 
             chunk_step_result = ChunkStepResult(
                 dones=dones,
@@ -683,7 +763,7 @@ class MultiStepRolloutWorker(Worker):
                 truncations=env_output["truncations"],
                 terminations=env_output["terminations"],
                 prev_logprobs=None,
-                prev_values=result["prev_values"] if self.collect_prev_infos else None,
+                prev_values=prev_values,
                 forward_inputs=None,
             )
 
