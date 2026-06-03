@@ -1,0 +1,10 @@
+defaults:
+  - libero_sac_openvlaoft_adapter_online
+
+runner:
+  logger:
+    experiment_name: "libero_sac_openvlaoft_adapter_online_state_sp"
+  ckpt_path: null
+
+adapter:
+  state_components: ["states"]

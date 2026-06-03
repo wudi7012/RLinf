@@ -30,6 +30,8 @@ from rlinf.models.vla_adapter.base_feature_extractor import (
     extract_features_from_prediction_result,
 )
 
+_VALID_STATE_COMPONENTS = ("features", "states", "base_actions")
+
 
 def _get_cfg_value(cfg, key: str, default):
     if cfg is None:
@@ -115,9 +117,13 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
         self._freeze_base_vla()
 
         feature_dim = self._infer_feature_dim()
-        adapter_input_dim = feature_dim + self.proprio_dim + (
-            self.num_action_chunks * self.action_dim
-        )
+        self.state_components = self._parse_state_components()
+        dim_by_component = {
+            "features": feature_dim,
+            "states": self.proprio_dim,
+            "base_actions": self.flat_action_dim,
+        }
+        adapter_input_dim = sum(dim_by_component[name] for name in self.state_components)
         self.adapter_input_dim = adapter_input_dim
         self.adapter_actor = ResidualGaussianActor(
             input_dim=adapter_input_dim,
@@ -262,17 +268,46 @@ class ResidualChunkAdapterPolicy(nn.Module, BasePolicy):
             "Please set `actor.model.proprio_dim` in the config."
         )
 
+    def _parse_state_components(self) -> tuple[str, ...]:
+        components = _get_cfg_value(
+            self.adapter_cfg,
+            "state_components",
+            ("features", "states", "base_actions"),
+        )
+        if isinstance(components, str):
+            components = (components,)
+        components = tuple(str(name) for name in components)
+        if not components:
+            raise ValueError("`adapter.state_components` must contain at least one item.")
+        invalid = [name for name in components if name not in _VALID_STATE_COMPONENTS]
+        if invalid:
+            raise ValueError(
+                "`adapter.state_components` only supports "
+                f"{list(_VALID_STATE_COMPONENTS)}; got invalid values {invalid}."
+            )
+        if len(set(components)) != len(components):
+            raise ValueError(
+                f"`adapter.state_components` contains duplicates: {components}."
+            )
+        return components
+
     def _build_adapter_inputs(
         self,
         features: torch.Tensor,
         states: torch.Tensor,
         base_actions: torch.Tensor,
     ) -> torch.Tensor:
-        base_actions_flat = base_actions.flatten(start_dim=1)
-        adapter_inputs = torch.cat(
-            [features, states.to(dtype=features.dtype), base_actions_flat.to(features.dtype)],
-            dim=-1,
-        )
+        tensors = {
+            "features": features,
+            "states": states,
+            "base_actions": base_actions.flatten(start_dim=1),
+        }
+        ref_tensor = tensors[self.state_components[0]]
+        parts = [
+            tensors[name].to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+            for name in self.state_components
+        ]
+        adapter_inputs = torch.cat(parts, dim=-1)
         adapter_param = next(self.adapter_actor.parameters())
         return adapter_inputs.to(
             device=adapter_param.device,
